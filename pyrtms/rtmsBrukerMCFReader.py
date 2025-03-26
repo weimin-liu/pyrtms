@@ -195,7 +195,7 @@ def sqlt_parseRecordValue(scon, type):
 def getBrukerMCFSpectrum(reader, index):
     if not isinstance(reader, RtmsBrukerMCFReader):
         raise ValueError("reader must be an instance of RtmsBrukerMCFReader")
-    if index <= 0 or index > len(reader.spotTable):
+    if index < 0 or index > len(reader.spotTable):
         raise IndexError("Index out of bounds")
 
     fcon = reader.con
