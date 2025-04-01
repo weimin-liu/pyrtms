@@ -6,25 +6,28 @@ import sys
 import math
 import struct
 import zlib
+import multiprocessing as mp
 
 
 class RtmsBrukerMCFReader:
-    def __init__(self, dir, files, spotTable, offsetTable, metadata, con=None):
+    def __init__(self, dir, files, spotTable, offsetTable, metadata):
         assert isinstance(dir, str), "dir must be a string"
         assert isinstance(files, list), "files must be a dictionary"
         assert isinstance(spotTable, pd.DataFrame), "spotTable must be a DataFrame"
         assert isinstance(offsetTable, pd.DataFrame), "offsetTable must be a DataFrame"
         assert isinstance(metadata, dict), "metadata must be a dictionary"
-        if con is not None:
-            assert hasattr(con, "read"), "con must be a file-like object"
 
         self.dir = dir
         self.files = files
         self.spotTable = spotTable
         self.offsetTable = offsetTable
         self.metadata = metadata
-        self.con = con
         self.spots = None
+
+    @property
+    def con(self):
+        return open(os.path.join(self.dir, self.files[0]), "rb")
+
 
     def get_spots(self):
         mainIndex = self.files[1]
@@ -52,7 +55,6 @@ class RtmsBrukerMCFReader:
         self.spots = spots.drop(columns=["id"])
         return self.spots
 
-    # a constructor for the RtmsBrukerMCFReader instance
     @classmethod
     def from_dir(cls, mcfdir):
         files = os.listdir(mcfdir)
@@ -95,8 +97,14 @@ class RtmsBrukerMCFReader:
                 spotTable=spotTable,
                 offsetTable=offsetTable,
                 metadata=metadata,
-                con=mcfcon
             )
+
+    def get_mul_spectra(self, indices,n_jobs=-1):
+        if n_jobs == -1:
+            n_jobs = mp.cpu_count()
+        with mp.Pool(n_jobs) as pool:
+            results = pool.map(self.get_spectrum, indices)
+        return results
 
     def get_spectrum(self, index):
         if index < 0 or index > len(self.spotTable):
@@ -149,6 +157,7 @@ class RtmsBrukerMCFReader:
             raise ValueError("Raw spectra must be an array of 32-bit floats.")
 
         mz = np.array([indexToMass(i) for i in range(numValues)])
+
         return pd.DataFrame({"mz": mz, "intensity": spectrum})
 
     def get_metadata(self, index):
@@ -792,4 +801,4 @@ if __name__ == "__main__":
     reader = newBrukerMCFReader("/Users/weimin/Downloads/2018_01_28_SBB_0-5_PAH_G/2018_01_28_SBB_0-5_PAH_G.d")
     metadata = getBrukerMCFAllMetadata(reader,index=1)
     spots = getBrukerMCFSpots(reader)
-    getBrukerMCFSpectrum(reader, 1)
+    results = reader.get_mul_spectra(range(100))
