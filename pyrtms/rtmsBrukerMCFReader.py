@@ -7,6 +7,7 @@ import math
 import struct
 import zlib
 
+
 class RtmsBrukerMCFReader:
     def __init__(self, dir, files, spotTable, offsetTable, metadata, con=None):
         assert isinstance(dir, str), "dir must be a string"
@@ -23,6 +24,194 @@ class RtmsBrukerMCFReader:
         self.offsetTable = offsetTable
         self.metadata = metadata
         self.con = con
+        self.spots = None
+
+    def get_spots(self):
+        mainIndex = self.files[1]
+        with open(os.path.join(self.dir, mainIndex), "rb") as scon:
+            _, mainTable = sqlt_parseBTreeTable(scon,
+                                                1,
+                                                lambda values, cellIndex: {"name": values[1], "value": values[3]},
+                                                first=True)
+            metaRoot = int(mainTable.loc[mainTable["name"] == "MetaDataString", "value"].values[0])
+            _, metasout = sqlt_parseBTreeTable(scon,
+                                               metaRoot,
+                                               lambda values, cellIndex: {
+                                                   "MetadataId": values[2],
+                                                   "Text": values[3],
+                                                   "id": f"{values[0]} {values[1]}"
+                                               },
+                                               first=False)
+
+        wmeta1 = metasout[metasout["MetadataId"] == 64][["id", "Text"]].rename(columns={"Text": "SpotNumber"})
+        wmeta2 = metasout[metasout["MetadataId"] == 34][["id", "Text"]].rename(columns={"Text": "Timestamp"})
+        wmeta = pd.merge(wmeta1, wmeta2, on="id", how="outer")
+
+        spots = pd.merge(reader.spotTable[["id", "index"]], wmeta, on="id", how="left")
+        spots = spots.sort_values("index").reset_index(drop=True)
+        self.spots = spots.drop(columns=["id"])
+        return self.spots
+
+    # a constructor for the RtmsBrukerMCFReader instance
+    @classmethod
+    def from_dir(cls, mcfdir):
+        files = os.listdir(mcfdir)
+        mainFile = [f for f in files if f.endswith('_1.mcf')]
+        if len(mainFile) == 0:
+            raise Exception('Main data file not found in directory.')
+        else:
+            mainFile = mainFile[0]
+            mainIndex = mainFile + "_idx"
+            if mainIndex not in files:
+                raise Exception('Main index file not found in directory.')
+            calibFile = mainFile.replace("_1.mcf", "_2.mcf")
+            if calibFile not in files:
+                raise Exception('Calibration data file not found in directory.')
+            calibIndex = calibFile + "_idx"
+            if calibIndex not in files:
+                raise Exception('Calibration index file not found in directory.')
+            files = [mainFile, mainIndex, calibFile, calibIndex]
+            offsetTable = readBrukerMCFIndexFile(os.path.join(mcfdir, mainIndex), calibration=False)
+            calOffsets = readBrukerMCFIndexFile(os.path.join(mcfdir, calibIndex), calibration=True)
+            calOffsets = calOffsets.reset_index()
+
+            subset_ids = offsetTable.loc[offsetTable["BlobResType"] == 258, ["id"]]
+            spotCalOffsets = calOffsets.merge(subset_ids, left_on="toId", right_on="id", how="inner", sort=False)
+            spotCalOffsets = spotCalOffsets.sort_values("index").reset_index(drop=True)
+            spotCalData = readMCFCalibration(os.path.join(mcfdir, calibFile), spotCalOffsets)
+            spotCalData = spotCalData.reset_index()
+
+            spotTable = spotCalData.sort_index()
+            spotTable = spotTable.rename(columns={"toId": "id"})
+
+            mcfcon = open(os.path.join(mcfdir, mainFile), "rb")
+
+            paramBlobOffset = offsetTable["Offset"].iloc[2]  # 0-based index in Python
+
+            metadata = retrieveMCFMetadata(mcfcon, paramBlobOffset, 0)
+            return cls(
+                dir=mcfdir,
+                files=files,
+                spotTable=spotTable,
+                offsetTable=offsetTable,
+                metadata=metadata,
+                con=mcfcon
+            )
+
+    def get_spectrum(self, index):
+        if index < 0 or index > len(self.spotTable):
+            raise IndexError("Index out of bounds")
+
+        fcon = self.con
+        row = self.spotTable.iloc[index - 1]
+        spotId = row["id"]
+        fhigh = row["frequencyHigh"]
+        fwidth = row["frequencyWidth"]
+        fsize = row["size"]
+        alpha = row["alpha"]
+        beta = row["beta"]
+
+        def massToIndex(p):
+            return fsize * (fwidth - (fhigh / (p - alpha / fhigh) + beta)) / fwidth
+
+        def indexToMass(i):
+            return fhigh / ((fwidth * (fsize - i) / fsize) - beta) + alpha / fhigh
+
+        # Seek to raw data blob
+        blob_row = self.offsetTable[(self.offsetTable["id"] == spotId) &
+                                      (self.offsetTable["BlobResType"] == 258)].iloc[0]
+        mcf_blobSeek(fcon, blob_row["Offset"], blob_row["OffsetPage"])
+
+        mcf_checkBlobCodeWord(fcon)
+        bin_checkBytes(fcon, b"\x01\x01")
+        fcon.seek(16, 1)
+        _ = bin_readVarInt(fcon)
+
+        name = mcf_readNamedName(fcon)
+        if name != "Intensities":
+            raise ValueError("First named element of raw data blob should be 'Intensities'")
+
+        bin_checkBytes(fcon, b"\x03", "Raw spectra must be an array.")
+        typeByte = fcon.read(1)
+
+        if typeByte == b"\x20":  # uncompressed 32-bit floats
+            compressed = False
+            numValues = bin_readVarInt(fcon)
+            spectrum = np.frombuffer(fcon.read(numValues * 4), dtype="<f4")
+        elif typeByte == b"\x22":  # gzip-compressed
+            compressed = True
+            numBytes = bin_readVarInt(fcon)
+            gzippedBytes = fcon.read(numBytes)
+            unzipped = zlib.decompress(gzippedBytes)
+            spectrum = np.frombuffer(unzipped, dtype="<f4")
+            numValues = len(spectrum)
+        else:
+            raise ValueError("Raw spectra must be an array of 32-bit floats.")
+
+        mz = np.array([indexToMass(i) for i in range(numValues)])
+        return pd.DataFrame({"mz": mz, "intensity": spectrum})
+
+    def get_metadata(self, index):
+        blobRow = self.offsetTable[
+            (self.offsetTable["id"] == self.spotTable.iloc[index]["id"]) &
+            (self.offsetTable["BlobResType"] == 259)
+            ].index[0]
+
+        dectable = self.metadata["declarations"]
+        reptable = self.metadata["replacements"]
+
+        fcon = self.con
+        offset = self.offsetTable.at[blobRow, "Offset"]
+        offsetPage = self.offsetTable.at[blobRow, "OffsetPage"]
+        mcf_blobSeek(fcon, offset, offsetPage)
+
+        mcf_checkBlobCodeWord(fcon)
+        bin_checkBytes(fcon, b"\x01\x01")
+        fcon.seek(16, 1)
+        numNamedEls = bin_readVarInt(fcon)
+
+        allMeta = []
+
+        for _ in range(numNamedEls):
+            name = mcf_readNamedName(fcon)
+            if fcon.read(1) == b"\x00":
+                continue
+            else:
+                fcon.seek(-1, 1)
+
+            keyTable = mcf_readKeyValueTable(fcon)
+
+            if name == "IntValues":
+                keyTable = keyTable.rename(columns={"Value": "Code"})
+                keyTable = keyTable.merge(reptable, how="left", on=["Key", "Code"])
+                keyTable["Value"] = keyTable["Value"].fillna(keyTable["Code"].astype(str))
+                keyTable = keyTable.drop(columns="Code")
+                keyTable = dectable.merge(keyTable, how="right", on="Key")
+
+            elif name == "StringValues":
+                keyTable = dectable.merge(keyTable, how="right", on="Key")
+
+            elif name == "DoubleValues":
+                keyTable = dectable.merge(keyTable, how="right", on="Key")
+                keyTable["Value"] = keyTable.apply(
+                    lambda row: row["DisplayFormat"] % row["Value"] if "DisplayFormat" in row else str(
+                        row["Value"]),
+                    axis=1
+                )
+            else:
+                raise ValueError("Other metadata value types not supported.")
+
+            allMeta.append(keyTable)
+
+        metaTable = pd.concat(allMeta, ignore_index=True)
+        metaTable["Index"] = index
+
+        # Append units to values
+        rel = metaTable["Unit"] != ""
+        metaTable.loc[rel, "Value"] = metaTable.loc[rel, "Value"] + " " + metaTable.loc[rel, "Unit"]
+
+        return metaTable[["Index", "PermanentName", "DisplayName", "GroupName", "Value"]]
+
 
 def mcf_checkBlobCodeWord(fcon):
     expected = bytes([0xC0, 0xDE, 0xAF, 0xFE])
@@ -32,7 +221,6 @@ def bin_checkBytes(fcon, expected, message="Invalid bytes"):
     actual = fcon.read(len(expected))
     if actual != expected:
         raise ValueError(message)
-
 
 def mcf_readNamedName(fcon):
     first_byte = int.from_bytes(fcon.read(1), byteorder="big")
@@ -193,60 +381,7 @@ def sqlt_parseRecordValue(scon, type):
         return scon.read(length).decode("utf-8")
 
 def getBrukerMCFSpectrum(reader, index):
-    if not isinstance(reader, RtmsBrukerMCFReader):
-        raise ValueError("reader must be an instance of RtmsBrukerMCFReader")
-    if index < 0 or index > len(reader.spotTable):
-        raise IndexError("Index out of bounds")
-
-    fcon = reader.con
-    row = reader.spotTable.iloc[index - 1]
-
-    spotId = row["id"]
-    fhigh = row["frequencyHigh"]
-    fwidth = row["frequencyWidth"]
-    fsize = row["size"]
-    alpha = row["alpha"]
-    beta = row["beta"]
-
-    def massToIndex(p):
-        return fsize * (fwidth - (fhigh / (p - alpha / fhigh) + beta)) / fwidth
-
-    def indexToMass(i):
-        return fhigh / ((fwidth * (fsize - i) / fsize) - beta) + alpha / fhigh
-
-    # Seek to raw data blob
-    blob_row = reader.offsetTable[(reader.offsetTable["id"] == spotId) &
-                                  (reader.offsetTable["BlobResType"] == 258)].iloc[0]
-    mcf_blobSeek(fcon, blob_row["Offset"], blob_row["OffsetPage"])
-
-    mcf_checkBlobCodeWord(fcon)
-    bin_checkBytes(fcon, b"\x01\x01")
-    fcon.seek(16, 1)
-    _ = bin_readVarInt(fcon)
-
-    name = mcf_readNamedName(fcon)
-    if name != "Intensities":
-        raise ValueError("First named element of raw data blob should be 'Intensities'")
-
-    bin_checkBytes(fcon, b"\x03", "Raw spectra must be an array.")
-    typeByte = fcon.read(1)
-
-    if typeByte == b"\x20":  # uncompressed 32-bit floats
-        compressed = False
-        numValues = bin_readVarInt(fcon)
-        spectrum = np.frombuffer(fcon.read(numValues * 4), dtype="<f4")
-    elif typeByte == b"\x22":  # gzip-compressed
-        compressed = True
-        numBytes = bin_readVarInt(fcon)
-        gzippedBytes = fcon.read(numBytes)
-        unzipped = zlib.decompress(gzippedBytes)
-        spectrum = np.frombuffer(unzipped, dtype="<f4")
-        numValues = len(spectrum)
-    else:
-        raise ValueError("Raw spectra must be an array of 32-bit floats.")
-
-    mz = np.array([indexToMass(i) for i in range(numValues)])
-    return pd.DataFrame({"mz": mz, "intensity": spectrum})
+    return reader.get_spectrum(index)
 
 def sqlt_parseRecord(scon):
     headerSize = bin_readVarInt(scon, "big")
@@ -263,43 +398,7 @@ def sqlt_parseRecord(scon):
     return output
 
 def getBrukerMCFSpots(reader):
-    if not isinstance(reader, RtmsBrukerMCFReader):
-        raise ValueError("Parameter 'reader' must be of class 'RtmsBrukerMCFReader'")
-
-    mcfdir = reader.dir
-    mainIndex = reader.files[1]
-
-    with open(os.path.join(mcfdir, mainIndex), "rb") as scon:
-        def mainHandler(values, cellIndex):
-            return {"name": values[1], "value": values[3]}
-
-        _, mainTable = sqlt_parseBTreeTable(scon, 1, mainHandler, first=True)
-
-        metaRoot = int(mainTable.loc[mainTable["name"] == "MetaDataString", "value"].values[0])
-
-        def metastringHandler(values, cellIndex):
-            valueList = {
-                "GuidA": values[0],
-                "GuidB": values[1],
-                "MetadataId": values[2],
-                "Text": values[3]
-            }
-            valueList["id"] = f"{valueList['GuidA']} {valueList['GuidB']}"
-            del valueList["GuidA"]
-            del valueList["GuidB"]
-            return valueList
-
-        _, metasout = sqlt_parseBTreeTable(scon, metaRoot, metastringHandler, first=False)
-
-    wmeta1 = metasout[metasout["MetadataId"] == 64][["id", "Text"]].rename(columns={"Text": "SpotNumber"})
-    wmeta2 = metasout[metasout["MetadataId"] == 34][["id", "Text"]].rename(columns={"Text": "Timestamp"})
-    wmeta = pd.merge(wmeta1, wmeta2, on="id", how="outer")
-
-    spots = pd.merge(reader.spotTable[["id", "index"]], wmeta, on="id", how="left")
-    spots = spots.sort_values("index").reset_index(drop=True)
-    spots = spots.drop(columns=["id"])
-
-    return spots
+    return reader.get_spots()
 
 def sqlt_parseBTreeInteriorPage(pagecon, upper):
     pagecon.seek(2, io.SEEK_CUR)
@@ -346,7 +445,6 @@ def sqlt_parseBTreeLeafPage(pagecon, handler):
         valueList = sqlt_parseRecord(pagecon)
         rows[citer] = handler(valueList, cellIndex)
     return pd.DataFrame(rows)
-
 
 
 def sqlt_parseBTreeTable(scon, rootpage, handler, first=False):
@@ -490,52 +588,8 @@ def readBrukerMCFIndexFile(path, calibration=False):
         return containerdf
 
 
-
 def newBrukerMCFReader(mcfdir):
-    # find the MCF file in mcfdir
-    files = os.listdir(mcfdir)
-    mainFile = [f for f in files if f.endswith('_1.mcf')]
-    if len(mainFile) == 0:
-        raise Exception('Main data file not found in directory.')
-    else:
-        mainFile = mainFile[0]
-        mainIndex = mainFile + "_idx"
-        if mainIndex not in files:
-            raise Exception('Main index file not found in directory.')
-        calibFile = mainFile.replace("_1.mcf", "_2.mcf")
-        if calibFile not in files:
-            raise Exception('Calibration data file not found in directory.')
-        calibIndex = calibFile + "_idx"
-        if calibIndex not in files:
-            raise Exception('Calibration index file not found in directory.')
-        files = [mainFile, mainIndex, calibFile, calibIndex]
-        offsetTable = readBrukerMCFIndexFile(os.path.join(mcfdir, mainIndex), calibration=False)
-        calOffsets = readBrukerMCFIndexFile(os.path.join(mcfdir, calibIndex), calibration=True)
-        calOffsets = calOffsets.reset_index()
-
-        subset_ids = offsetTable.loc[offsetTable["BlobResType"] == 258, ["id"]]
-        spotCalOffsets = calOffsets.merge(subset_ids, left_on="toId", right_on="id", how="inner", sort=False)
-        spotCalOffsets = spotCalOffsets.sort_values("index").reset_index(drop=True)
-        spotCalData = readMCFCalibration(os.path.join(mcfdir, calibFile), spotCalOffsets)
-        spotCalData = spotCalData.reset_index()
-
-        spotTable = spotCalData.sort_index()
-        spotTable = spotTable.rename(columns={"toId": "id"})
-
-        mcfcon = open(os.path.join(mcfdir,mainFile), "rb")
-
-        paramBlobOffset = offsetTable["Offset"].iloc[2]  # 0-based index in Python
-
-        metadata = retrieveMCFMetadata(mcfcon, paramBlobOffset, 0)
-        return RtmsBrukerMCFReader(
-            dir=mcfdir,
-            files=files,
-            spotTable=spotTable,
-            offsetTable=offsetTable,
-            metadata=metadata,
-            con=mcfcon
-        )
-
+    return RtmsBrukerMCFReader.from_dir(mcfdir)
 
 def mcf_blobSeek(fcon, offset, page):
     fcon.seek(0)
@@ -667,69 +721,8 @@ def retrieveMCFMetadata(fcon, offset, offsetPage=0):
 
     return {"declarations": outTable, "replacements": pd.DataFrame(valTable)}
 
-
-
 def getBrukerMCFAllMetadata(reader, index):
-    import pandas as pd
-
-    blobRow = reader.offsetTable[
-        (reader.offsetTable["id"] == reader.spotTable.iloc[index]["id"]) &
-        (reader.offsetTable["BlobResType"] == 259)
-    ].index[0]
-
-    dectable = reader.metadata["declarations"]
-    reptable = reader.metadata["replacements"]
-
-    fcon = reader.con
-    offset = reader.offsetTable.at[blobRow, "Offset"]
-    offsetPage = reader.offsetTable.at[blobRow, "OffsetPage"]
-    mcf_blobSeek(fcon, offset, offsetPage)
-
-    mcf_checkBlobCodeWord(fcon)
-    bin_checkBytes(fcon, b"\x01\x01")
-    fcon.seek(16, 1)
-    numNamedEls = bin_readVarInt(fcon)
-
-    allMeta = []
-
-    for _ in range(numNamedEls):
-        name = mcf_readNamedName(fcon)
-        if fcon.read(1) == b"\x00":
-            continue
-        else:
-            fcon.seek(-1, 1)
-
-        keyTable = mcf_readKeyValueTable(fcon)
-
-        if name == "IntValues":
-            keyTable = keyTable.rename(columns={"Value": "Code"})
-            keyTable = keyTable.merge(reptable, how="left", on=["Key", "Code"])
-            keyTable["Value"] = keyTable["Value"].fillna(keyTable["Code"].astype(str))
-            keyTable = keyTable.drop(columns="Code")
-            keyTable = dectable.merge(keyTable, how="right", on="Key")
-
-        elif name == "StringValues":
-            keyTable = dectable.merge(keyTable, how="right", on="Key")
-
-        elif name == "DoubleValues":
-            keyTable = dectable.merge(keyTable, how="right", on="Key")
-            keyTable["Value"] = keyTable.apply(
-                lambda row: row["DisplayFormat"] % row["Value"] if "DisplayFormat" in row else str(row["Value"]),
-                axis=1
-            )
-        else:
-            raise ValueError("Other metadata value types not supported.")
-
-        allMeta.append(keyTable)
-
-    metaTable = pd.concat(allMeta, ignore_index=True)
-    metaTable["Index"] = index
-
-    # Append units to values
-    rel = metaTable["Unit"] != ""
-    metaTable.loc[rel, "Value"] = metaTable.loc[rel, "Value"] + " " + metaTable.loc[rel, "Unit"]
-
-    return metaTable[["Index", "PermanentName", "DisplayName", "GroupName", "Value"]]
+    return reader.get_metadata(index)
 
 def mcf_readKeyValueTable(fcon):
     bin_checkBytes(fcon, b"\x03\x01")
@@ -796,4 +789,7 @@ def mcf_readKeyValueRow(fcon):
     return output
 
 if __name__ == "__main__":
-    pass
+    reader = newBrukerMCFReader("/Users/weimin/Downloads/2018_01_28_SBB_0-5_PAH_G/2018_01_28_SBB_0-5_PAH_G.d")
+    metadata = getBrukerMCFAllMetadata(reader,index=1)
+    spots = getBrukerMCFSpots(reader)
+    getBrukerMCFSpectrum(reader, 1)
