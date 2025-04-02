@@ -7,6 +7,8 @@ import math
 import struct
 import zlib
 import multiprocessing as mp
+from pyopenms import MSSpectrum, PeakPickerHiRes
+from functools import partial
 
 
 class RtmsBrukerMCFReader:
@@ -61,7 +63,7 @@ class RtmsBrukerMCFReader:
         wmeta2 = metasout[metasout["MetadataId"] == 34][["id", "Text"]].rename(columns={"Text": "Timestamp"})
         wmeta = pd.merge(wmeta1, wmeta2, on="id", how="outer")
 
-        spots = pd.merge(reader.spotTable[["id", "index"]], wmeta, on="id", how="left")
+        spots = pd.merge(self.spotTable[["id", "index"]], wmeta, on="id", how="left")
         spots = spots.sort_values("index").reset_index(drop=True)
         self.spots = spots.drop(columns=["id"])
         return self.spots
@@ -110,12 +112,69 @@ class RtmsBrukerMCFReader:
                 metadata=metadata,
             )
 
-    def get_mul_spectra(self, indices,n_jobs=-1):
+    def get_mul_spectra(self, indices,n_jobs=-1, show_progress=True):
         if n_jobs == -1:
             n_jobs = mp.cpu_count()
         with mp.Pool(n_jobs) as pool:
-            results = pool.map(self.get_spectrum, indices)
+            if show_progress:
+                from tqdm import tqdm
+                results = list(tqdm(pool.imap(self.get_spectrum, indices), total=len(indices)))
+            else:
+                results = pool.map(self.get_spectrum, indices)
         return results
+
+    def pick_mul_spectra(self, indices, n_job=-1, show_progress=True, **kwargs):
+
+        f = partial(self.pick_spectrum, **kwargs)
+
+        if n_job == -1:
+            n_job = mp.cpu_count()
+        with mp.Pool(n_job) as pool:
+            if show_progress:
+                from tqdm import tqdm
+                results = list(tqdm(pool.imap(f, indices), total=len(indices)))
+            else:
+                results = pool.map(f, indices)
+        return results
+
+    def pick_spectrum(self, index, target_mzs = None, tol = 10, snr=0.0):
+        spec = self.get_spectrum(index)
+        spec = spec.sort_values("mz")
+        spec_obj = MSSpectrum()
+        spec_obj.set_peaks([spec.mz.to_numpy(), spec.intensity.to_numpy()])
+
+        picker = PeakPickerHiRes()
+        picker_params = picker.getParameters()
+        picker_params.setValue("signal_to_noise", float(snr))
+        picker.setParameters(picker_params)
+
+        res_spec = MSSpectrum()
+
+        picker.pick(spec_obj, res_spec)
+
+        mz, intensity = res_spec.get_peaks()
+
+        if target_mzs is None:
+            return pd.DataFrame({"mz": mz, "intensity": intensity})
+        else:
+            result = []
+            for target_mz in target_mzs:
+                if tol > 0.1:
+                    # if tol > 0.1, it is considered as ppm
+                    mz_tol = target_mz * tol / 1e6
+                else:
+                    mz_tol = tol
+                mask = (mz >= target_mz - mz_tol/2) & (mz <= target_mz + mz_tol/2)
+                # find the peak with the highest intensity within the tolerance
+                if np.sum(mask) > 0:
+                    result.append(
+                        [mz[mask][np.argmax(intensity[mask])],
+                        max(intensity[mask])]
+                    )
+                else:
+                    result.append([np.nan, np.nan])
+            return pd.DataFrame(result, columns=["mz", "intensity"])
+
 
     def get_spectrum(self, index, CASI_only=True):
         if index < 0 or index > len(self.spotTable):
@@ -499,8 +558,8 @@ def sqlt_parseBTreeTable(scon, rootpage, handler, first=False):
             )
             pagedf.at[curpageind, "Type"] = "Leaf"
         elif pageType != 5:
-            raise ValueError("Page must be b-tree leaf or interior page")
             pagecon.close()
+            raise ValueError("Page must be b-tree leaf or interior page")
         pagecon.close()
 
     pagedf = pagedf.sort_values("Upper").reset_index(drop=True)
@@ -810,6 +869,20 @@ def mcf_readKeyValueRow(fcon):
             output["Value"] = prim
 
     return output
+
+class BrukerMCFExporter:
+    def __init__(self, reader):
+        self.reader = reader
+        self.spots = None
+        self.spectra = None
+
+        self.preprocess()
+
+    def preprocess(self):
+        # get all spots
+        self.spots = self.reader.get_spots()
+        # get all spectra
+        self.spectra = self.reader.get_mul_spectra(self.spots.index)
 
 
 if __name__ == "__main__":
