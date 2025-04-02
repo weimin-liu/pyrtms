@@ -10,14 +10,14 @@ import multiprocessing as mp
 
 
 class RtmsBrukerMCFReader:
-    def __init__(self, dir, files, spotTable, offsetTable, metadata):
-        assert isinstance(dir, str), "dir must be a string"
+    def __init__(self, mcfdir, files, spotTable, offsetTable, metadata):
+        assert isinstance(mcfdir, str), "dir must be a string"
         assert isinstance(files, list), "files must be a dictionary"
         assert isinstance(spotTable, pd.DataFrame), "spotTable must be a DataFrame"
         assert isinstance(offsetTable, pd.DataFrame), "offsetTable must be a DataFrame"
         assert isinstance(metadata, dict), "metadata must be a dictionary"
 
-        self.dir = dir
+        self.mcfdir = mcfdir
         self.files = files
         self.spotTable = spotTable
         self.offsetTable = offsetTable
@@ -25,13 +25,24 @@ class RtmsBrukerMCFReader:
         self.spots = None
 
     @property
-    def con(self):
-        return open(os.path.join(self.dir, self.files[0]), "rb")
+    def metadataDF(self):
+        return self.get_metadata(1)
 
+    @property
+    def q1mass(self):
+        return float(self.metadataDF.query("PermanentName == 'Q1Mass'")["Value"].values[0].split(' ')[0])
+
+    @property
+    def q1res(self):
+        return float(self.metadataDF.query("PermanentName == 'Q1Res'")["Value"].values[0].split(' ')[0])
+
+    @property
+    def con(self):
+        return open(os.path.join(self.mcfdir, self.files[0]), "rb")
 
     def get_spots(self):
         mainIndex = self.files[1]
-        with open(os.path.join(self.dir, mainIndex), "rb") as scon:
+        with open(os.path.join(self.mcfdir, mainIndex), "rb") as scon:
             _, mainTable = sqlt_parseBTreeTable(scon,
                                                 1,
                                                 lambda values, cellIndex: {"name": values[1], "value": values[3]},
@@ -92,7 +103,7 @@ class RtmsBrukerMCFReader:
 
             metadata = retrieveMCFMetadata(mcfcon, paramBlobOffset, 0)
             return cls(
-                dir=mcfdir,
+                mcfdir=mcfdir,
                 files=files,
                 spotTable=spotTable,
                 offsetTable=offsetTable,
@@ -106,7 +117,7 @@ class RtmsBrukerMCFReader:
             results = pool.map(self.get_spectrum, indices)
         return results
 
-    def get_spectrum(self, index):
+    def get_spectrum(self, index, CASI_only=True):
         if index < 0 or index > len(self.spotTable):
             raise IndexError("Index out of bounds")
 
@@ -158,6 +169,9 @@ class RtmsBrukerMCFReader:
 
         mz = np.array([indexToMass(i) for i in range(numValues)])
 
+        if CASI_only:
+            spectrum = spectrum[(mz >= self.q1mass - self.q1res/2) & (mz <= self.q1mass + self.q1res/2)]
+            mz = mz[(mz >= self.q1mass - self.q1res/2) & (mz <= self.q1mass + self.q1res/2)]
         return pd.DataFrame({"mz": mz, "intensity": spectrum})
 
     def get_metadata(self, index):
@@ -797,8 +811,7 @@ def mcf_readKeyValueRow(fcon):
 
     return output
 
+
 if __name__ == "__main__":
-    reader = newBrukerMCFReader("/Users/weimin/Downloads/2018_01_28_SBB_0-5_PAH_G/2018_01_28_SBB_0-5_PAH_G.d")
-    metadata = getBrukerMCFAllMetadata(reader,index=1)
-    spots = getBrukerMCFSpots(reader)
-    results = reader.get_mul_spectra(range(100))
+    pass
+
