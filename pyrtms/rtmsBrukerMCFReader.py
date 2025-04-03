@@ -1,14 +1,15 @@
 import os
+import sqlite3
+
 import pandas as pd
 import numpy as np
-import io
-import sys
-import math
+
 import struct
 import zlib
 import multiprocessing as mp
 from pyopenms import MSSpectrum, PeakPickerHiRes
 from functools import partial
+
 
 
 class RtmsBrukerMCFReader:
@@ -44,28 +45,12 @@ class RtmsBrukerMCFReader:
 
     def get_spots(self):
         mainIndex = self.files[1]
-        with open(os.path.join(self.mcfdir, mainIndex), "rb") as scon:
-            _, mainTable = sqlt_parseBTreeTable(scon,
-                                                1,
-                                                lambda values, cellIndex: {"name": values[1], "value": values[3]},
-                                                first=True)
-            metaRoot = int(mainTable.loc[mainTable["name"] == "MetaDataString", "value"].values[0])
-            _, metasout = sqlt_parseBTreeTable(scon,
-                                               metaRoot,
-                                               lambda values, cellIndex: {
-                                                   "MetadataId": values[2],
-                                                   "Text": values[3],
-                                                   "id": f"{values[0]} {values[1]}"
-                                               },
-                                               first=False)
 
-        wmeta1 = metasout[metasout["MetadataId"] == 64][["id", "Text"]].rename(columns={"Text": "SpotNumber"})
-        wmeta2 = metasout[metasout["MetadataId"] == 34][["id", "Text"]].rename(columns={"Text": "Timestamp"})
-        wmeta = pd.merge(wmeta1, wmeta2, on="id", how="outer")
-
-        spots = pd.merge(self.spotTable[["id", "index"]], wmeta, on="id", how="left")
-        spots = spots.sort_values("index").reset_index(drop=True)
-        self.spots = spots.drop(columns=["id"])
+        with sqlite3.connect(os.path.join(self.mcfdir, mainIndex)) as conn:
+            cur = conn.cursor()
+            spot_name = cur.execute("SELECT GuidA, GuidB, MetaDataID, Value from MetaDataString WHERE MetaDataID='64'")
+            spot_name = spot_name.fetchall()
+            self.spots = pd.DataFrame(spot_name, columns=["GuidA", "GuidB", "MetaDataID", "SpotNumber"])
         return self.spots
 
     @classmethod
@@ -88,13 +73,10 @@ class RtmsBrukerMCFReader:
             files = [mainFile, mainIndex, calibFile, calibIndex]
             offsetTable = readBrukerMCFIndexFile(os.path.join(mcfdir, mainIndex), calibration=False)
             calOffsets = readBrukerMCFIndexFile(os.path.join(mcfdir, calibIndex), calibration=True)
-            calOffsets = calOffsets.reset_index()
 
             subset_ids = offsetTable.loc[offsetTable["BlobResType"] == 258, ["id"]]
             spotCalOffsets = calOffsets.merge(subset_ids, left_on="toId", right_on="id", how="inner", sort=False)
-            spotCalOffsets = spotCalOffsets.sort_values("index").reset_index(drop=True)
             spotCalData = readMCFCalibration(os.path.join(mcfdir, calibFile), spotCalOffsets)
-            spotCalData = spotCalData.reset_index()
 
             spotTable = spotCalData.sort_index()
             spotTable = spotTable.rename(columns={"toId": "id"})
@@ -137,7 +119,7 @@ class RtmsBrukerMCFReader:
                 results = pool.map(f, indices)
         return results
 
-    def pick_spectrum(self, index, target_mzs = None, tol = 10, snr=0.0):
+    def pick_spectrum(self, index, target_mzs = None, tol = 10, snr=0.0, intensity=1e6):
         spec = self.get_spectrum(index)
         spec = spec.sort_values("mz")
         spec_obj = MSSpectrum()
@@ -182,6 +164,8 @@ class RtmsBrukerMCFReader:
 
         fcon = self.con
         row = self.spotTable.iloc[index - 1]
+
+        # the following parameters derived from spotTable are the calibrated parameters.
         spotId = row["id"]
         fhigh = row["frequencyHigh"]
         fwidth = row["frequencyWidth"]
@@ -413,260 +397,52 @@ def readMCFCalibration(path, offsetTable):
 
     return pd.DataFrame(caltab)
 
-def sqlt_getPage(scon, page):
-    assert page == int(page)
-    page = int(page)
-    scon.seek((page - 1) * 1024)
-    rawpage = scon.read(1024)
-    rawcon = io.BytesIO(rawpage)
-    return rawcon
-
-def sqlt_parseRecordValue(scon, type):
-    if type == 0:
-        return np.nan
-    elif type < 0 or not isinstance(type, int):
-        raise ValueError("Unsupported record data type")
-    elif type == 8:
-        return 0
-    elif type == 9:
-        return 1
-    elif type == 12:
-        return bytes()
-    elif type == 13:
-        return ""
-    elif type == 1:
-        return int.from_bytes(scon.read(1), byteorder=sys.byteorder, signed=True)
-    elif type == 2:
-        return int.from_bytes(scon.read(2), byteorder='big', signed=True)
-    elif type == 3:
-        tempraw = b'\x00' + scon.read(3)
-        return int.from_bytes(tempraw, byteorder='big', signed=True)
-    elif type == 4:
-        return int.from_bytes(scon.read(4), byteorder='big', signed=True)
-    elif type == 5:
-        tempraw = b'\x00\x00' + scon.read(6)
-        # unpack two big-endian 4-byte signed integers
-        ints = struct.unpack(">ii", tempraw)
-        return ints[::-1]  # reverse the tuple
-    elif type == 6:
-        ints = struct.unpack(">ii", scon.read(8))  # read 2 x 4-byte signed ints
-        return ints[::-1]  # reverse the order
-    elif type == 7:
-        return struct.unpack(">d", scon.read(8))[0]
-    elif type == 10 or type == 11:
-        raise TypeError("Unsupported record data type")
-    elif type % 2 == 0:
-        length = (type - 12) // 2
-        return scon.read(length)
-    else:
-        length = (type - 13) // 2
-        return scon.read(length).decode("utf-8")
-
 def getBrukerMCFSpectrum(reader, index):
     return reader.get_spectrum(index)
-
-def sqlt_parseRecord(scon):
-    headerSize = bin_readVarInt(scon, "big")
-    headerRemaining = headerSize - 1
-    dataTypes = []
-    while headerRemaining > 0:
-        nextCode = bin_readVarInt(scon, "big")
-        dataTypes.append(nextCode)
-        headerRemaining -= max(math.ceil(math.log(nextCode, 128)), 1)
-    output = [
-        sqlt_parseRecordValue(scon, dataTypes[dtiter])
-        for dtiter in range(len(dataTypes))
-    ]
-    return output
 
 def getBrukerMCFSpots(reader):
     return reader.get_spots()
 
-def sqlt_parseBTreeInteriorPage(pagecon, upper):
-    pagecon.seek(2, io.SEEK_CUR)
-    numCells = int.from_bytes(pagecon.read(2), byteorder='big', signed=False)
-    cellStart = int.from_bytes(pagecon.read(2), byteorder='big', signed=False)
-    pagecon.seek(1, io.SEEK_CUR)
-    #TODO: signed =True is it correct?
-    finalPage = int.from_bytes(pagecon.read(4), byteorder='big', signed=True)
-    cellPointers = [
-        int.from_bytes(pagecon.read(2), byteorder='big', signed=False)
-        for _ in range(numCells)
-    ]
-
-    newpagedf = pd.DataFrame({
-        "Page": [np.nan] * numCells,
-        "Upper": [np.nan] * numCells,
-        "Type": ["None"] * numCells
-    })
-
-    for citer in range(numCells):
-        pagecon.seek(cellPointers[citer])
-        newpagedf.at[citer, "Page"] = int.from_bytes(pagecon.read(4), byteorder='big', signed=True)
-        newpagedf.at[citer, "Upper"] = bin_readVarInt(pagecon, "big")
-    new_row = pd.DataFrame([{"Page": finalPage, "Upper": upper, "Type": "None"}])
-    return pd.concat([newpagedf, new_row], ignore_index=True)
-
-def sqlt_parseBTreeLeafPage(pagecon, handler):
-    if handler is None:
-        return []
-    pagecon.seek(2, io.SEEK_CUR)
-    numCells = int.from_bytes(pagecon.read(2), byteorder='big', signed=False)
-    cellStart = int.from_bytes(pagecon.read(2), byteorder='big', signed=False)
-    pagecon.seek(1, io.SEEK_CUR)
-    cellPointers = [
-        int.from_bytes(pagecon.read(2), byteorder='big', signed=False)
-        for _ in range(numCells)
-    ]
-
-    rows = [[] for _ in range(numCells)]
-    for citer in range(numCells):
-        pagecon.seek(cellPointers[citer])
-        cellSize = bin_readVarInt(pagecon, "big")
-        cellIndex = bin_readVarInt(pagecon, "big")
-        valueList = sqlt_parseRecord(pagecon)
-        rows[citer] = handler(valueList, cellIndex)
-    return pd.DataFrame(rows)
-
-
-def sqlt_parseBTreeTable(scon, rootpage, handler, first=False):
-    pastTheFirst = not first
-    pagedf = pd.DataFrame({
-        "Page": [rootpage],
-        "Upper": [np.inf],
-        "Type": ["None"]
-    })
-    outputdf = pd.DataFrame()
-
-    while True:
-        if "None" not in pagedf['Type'].unique():
-            break
-        curpageind = pagedf[pagedf['Type'] == "None"].index[0]
-        curpage = pagedf.iloc[curpageind]
-        pagecon = sqlt_getPage(scon, curpage['Page'])
-        if not pastTheFirst:
-            pagecon.seek(100)
-            pastTheFirst = True
-        pageType = int.from_bytes(pagecon.read(1), byteorder='big', signed=False)
-        if pageType == 5:
-            newpages = sqlt_parseBTreeInteriorPage(pagecon, pagedf.at[curpageind, "Upper"])
-            pagedf = pd.concat([pagedf.drop(curpageind), newpages], ignore_index=True)
-        elif pageType == 13:
-            outputdf = pd.concat(
-                [outputdf, sqlt_parseBTreeLeafPage(pagecon, handler)],
-                ignore_index=True
-            )
-            pagedf.at[curpageind, "Type"] = "Leaf"
-        elif pageType != 5:
-            pagecon.close()
-            raise ValueError("Page must be b-tree leaf or interior page")
-        pagecon.close()
-
-    pagedf = pagedf.sort_values("Upper").reset_index(drop=True)
-    return [pagedf, outputdf]
-
 def readBrukerMCFIndexFile(path, calibration=False):
-    def mainHandler(valueList, cellIndex):
-        def is_whole_number(x):
-            return isinstance(x, (int, float)) and float(x).is_integer()
-
-        if valueList[1] == "ContainerIndex":
-            if is_whole_number(valueList[3]):
-                return {"name": "blobRootPage", "value": int(valueList[3])}
-            else:
-                raise ValueError("Page record column should be an integer")
-        elif valueList[1] == "Relations":
-            if is_whole_number(valueList[3]):
-                return {"name": "relRootPage", "value": int(valueList[3])}
-            else:
-                raise ValueError("Page record column should be an integer")
-        else:
-            return None  # or return {}
-
-    def containerHandler(values, cellIndex):
-        # Unpack values assuming fixed order
-        valueList = {
-            "GuidA": values[0],
-            "GuidB": values[1],
-            "BlobResType": values[2],
-            "Offset": values[3],
-            "BlobSize": values[4],
-            "Index": cellIndex
-        }
-
-        # Construct ID from GuidA and GuidB
-        valueList["id"] = f"{valueList['GuidA']} {valueList['GuidB']}"
-
-        # Remove GuidA and GuidB
-        del valueList["GuidA"]
-        del valueList["GuidB"]
-
-        # Handle OffsetPage
-        offset = valueList["Offset"]
-        offset_page = 0
-
-        if isinstance(offset, (list, tuple)) and len(offset) > 1:
-            offset_page = offset[1] * 2
-            offset = offset[0]
-
-        if offset < 0:
-            offset_page += 1
-            offset = offset + (2 ** 31)
-
-        valueList["OffsetPage"] = offset_page
-        valueList["Offset"] = offset
-
-        return valueList
-
-    with open(path, 'rb') as scon:
-        _, mainTable = sqlt_parseBTreeTable(scon, 1, mainHandler, first=True)
-        mainTable = mainTable.dropna()
-        mainTable_dict = {}
-        for index, row in mainTable.iterrows():
-            mainTable_dict.update({index:row.values[0]})
-        mainTable = pd.DataFrame(mainTable_dict).T
-
+    with sqlite3.connect(path) as conn:
+        cur = conn.cursor()
         try:
-            containerRoot = mainTable.loc[mainTable["name"] == "blobRootPage", "value"].values[0]
-        except IndexError:
+            containerdf = cur.execute("SELECT * FROM ContainerIndex").fetchall()
+        except sqlite3.OperationalError:
             raise ValueError("ContainerIndex table not found.")
+        containerdf = pd.DataFrame(containerdf, columns=["GuidA", "GuidB", "BlobResType", "Offset", "BlobSize"])
+        containerdf['id'] = containerdf["GuidA"].astype(str) + containerdf["GuidB"].astype(str)
+        containerdf = containerdf.drop(columns=["GuidA", "GuidB"])
 
-        _, containerdf = sqlt_parseBTreeTable(scon, containerRoot, containerHandler, first=False)
+        offsets = containerdf["Offset"]
+        offset_page = np.zeros(len(offsets), dtype=int)
+
+        #TODO: check if the logic aligns with the original code
+        is_list = offsets.apply(lambda x: isinstance(x, (list, tuple)) and len(x) > 1)
+        if is_list.any():
+            offset0 = offsets.where(~is_list, offsets.apply(lambda x: x[0]))
+            offset_page = np.where(is_list, offsets.apply(lambda x: x[1] * 2), 0)
+            offsets = offset0
+
+        is_negative = offsets < 0
+        if is_negative.any():
+            offset_page += 1
+            offset0 = offsets.where(~is_negative, offsets.apply(lambda x: x + (2 ** 31)))
+            offsets = offset0
+        containerdf["Offset"] = offsets
+        containerdf["OffsetPage"] = offset_page
 
         if calibration:
-            relationRoot = mainTable.query("name == 'relRootPage'")["value"].values[0]
+            relation_df = cur.execute("SELECT * FROM Relations").fetchall()
+            relation_df = pd.DataFrame(relation_df, columns=["GuidA", "GuidB", "ToGuidA", "ToGuidB", "RelationType"])
+            relation_df["id"] = relation_df["GuidA"].astype(str) + relation_df["GuidB"].astype(str)
+            relation_df["toId"] = relation_df["ToGuidA"].astype(str) + relation_df["ToGuidB"].astype(str)
+            relation_df = relation_df.drop(columns=["GuidA", "GuidB", "ToGuidA", "ToGuidB"])
 
-            def relationHandler(values, cellIndex):
-                # Map values to named fields
-                valueList = {
-                    "GuidA": values[0],
-                    "GuidB": values[1],
-                    "ToGuidA": values[2],
-                    "ToGuidB": values[3],
-                    "RelationType": values[4],
-                }
+            containerdf = containerdf.merge(relation_df, on="id", how="left")
 
-                # Construct IDs
-                valueList["id"] = f"{valueList['GuidA']} {valueList['GuidB']}"
-                valueList["toId"] = f"{valueList['ToGuidA']} {valueList['ToGuidB']}"
+        containerdf = containerdf.sort_index()
 
-                # Remove original GUID fields
-                del valueList["GuidA"]
-                del valueList["GuidB"]
-                del valueList["ToGuidA"]
-                del valueList["ToGuidB"]
-
-                return valueList
-            _, relationdf = sqlt_parseBTreeTable(scon, relationRoot, relationHandler, first=False)
-            containerdf = containerdf.merge(relationdf, how="left")
-            containerdf = containerdf.sort_values("Index")[[
-                "Index", "id", "toId", "RelationType", "BlobResType", "Offset", "OffsetPage", "BlobSize"
-            ]]
-
-        else:
-            containerdf = containerdf.sort_values("Index")[[
-                "Index", "id", "BlobResType", "Offset", "OffsetPage", "BlobSize"
-            ]]
         return containerdf
 
 
@@ -886,5 +662,5 @@ class BrukerMCFExporter:
 
 
 if __name__ == "__main__":
-    pass
+    reader = RtmsBrukerMCFReader.from_dir("/Users/weimin/Downloads/2018_01_28_SBB_0-5_PAH_G/2018_01_28_SBB_0-5_PAH_G.d")
 
