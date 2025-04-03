@@ -83,7 +83,7 @@ class RtmsBrukerMCFReader:
 
             mcfcon = open(os.path.join(mcfdir, mainFile), "rb")
 
-            paramBlobOffset = offsetTable["Offset"].iloc[2]  # 0-based index in Python
+            paramBlobOffset = offsetTable["Offset"].iloc[2]
 
             metadata = retrieveMCFMetadata(mcfcon, paramBlobOffset, 0)
             return cls(
@@ -159,11 +159,11 @@ class RtmsBrukerMCFReader:
 
 
     def get_spectrum(self, index, CASI_only=True):
-        if index < 0 or index > len(self.spotTable):
+        if index < 0 or index >= len(self.spotTable):
             raise IndexError("Index out of bounds")
 
         fcon = self.con
-        row = self.spotTable.iloc[index - 1]
+        row = self.spotTable.iloc[index]
 
         # the following parameters derived from spotTable are the calibrated parameters.
         spotId = row["id"]
@@ -497,7 +497,7 @@ def mcf_readTable(fcon):
     return pd.DataFrame(outTable)
 
 def getBrukerMCFIndices(reader):
-    return reader.spotTable.index + 1
+    return reader.spotTable.index
 
 def mcf_readPrimitiveArray(fcon):
     bin_checkBytes(fcon, b"\x03")  # array marker
@@ -662,5 +662,5 @@ class BrukerMCFExporter:
 
 
 if __name__ == "__main__":
-    reader = RtmsBrukerMCFReader.from_dir("/Users/weimin/Downloads/2018_01_28_SBB_0-5_PAH_G/2018_01_28_SBB_0-5_PAH_G.d")
+    pass
 
