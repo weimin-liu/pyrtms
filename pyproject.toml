@@ -1,0 +1,21 @@
+[project]
+name = "pyrtms"
+version = "0.4.0"
+description = "A partial python import of the R package rtms https://cran.r-project.org/web/packages/rtms/index.html"
+readme = "README.md"
+authors = [{ name="Weimin Liu", email="wliu@marum.de" }]
+dependencies = [
+    "numpy",
+    "shiny",
+    "pyopenms",
+    "pandas",
+    "matplotlib",
+    "tqdm"
+    ]
+
+[project.scripts]
+rtms = "pyrtms.__main__:main"
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"

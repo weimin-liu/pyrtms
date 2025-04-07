@@ -3,13 +3,24 @@ import pandas as pd
 import os
 import shiny
 import matplotlib.pyplot as plt
+import multiprocessing as mp
 
 # Assume your reader and pipeline are in the same folder or in your PYTHONPATH
 from pyrtms.rtmsBrukerMCFReader import RtmsBrukerMCFReader, Pipeline
+import threading
+import time
+import webbrowser
 
 app_ui = ui.page_fluid(
     ui.h2("RTMS Data Processor"),
-    ui.input_text("data_path", "Enter path to Bruker .d folder"),
+    ui.layout_columns(
+        ui.input_text("data_path", "Enter path to Bruker .d folder"),
+            ui.input_numeric(
+                "n_jobs",
+                "Number of parallel jobs",
+                value=mp.cpu_count(),
+            ),
+    ),
     ui.card(
         ui.card_header("Calibration Parameters"),
             ui.layout_columns(
@@ -28,7 +39,19 @@ app_ui = ui.page_fluid(
                 ui.input_numeric("min_snr2", "SNR", value=0, step=0.1),
                 col_widths=2,
             )),
+    ui.layout_columns(
     ui.input_action_button("run_btn", "Run Pipeline", class_="btn-primary"),
+        ui.input_checkbox(
+            "plot_results",
+            "Plot results",
+            value=True
+        ),
+        ui.input_checkbox(
+            "save_csv",
+            "Save results as CSV",
+            value=True
+        ),
+    ),
     ui.output_text("status"),
     # plot the calibration results
     ui.output_plot("calibration_plot"),
@@ -55,7 +78,7 @@ def server(input, output, session):
 
         try:
             reader = RtmsBrukerMCFReader.from_dir(str(input.data_path()))
-            pipe = Pipeline(reader)
+            pipe = Pipeline(reader, n_jobs=input.n_jobs())
             pipe.set_calib_params(mz=input.mz(),
                                   tol=input.tol1(),
                                   min_intensity=input.min_intensity1(),
@@ -69,14 +92,15 @@ def server(input, output, session):
                                     min_snr=input.min_snr2())
             pipe.process()
             result = pipe.final_result
-
-            calibration_fig.set(pipe.plot_calibration())
-            twod_fig.set(result.viz2D())
+            if input.plot_results():
+                calibration_fig.set(pipe.plot_calibration())
+                twod_fig.set(result.viz2D())
             result_df.set(result.to_df())
             # save the DataFrame to a CSV file
-            result.to_df().to_csv(os.path.join(input.data_path(), 'result.csv'), index=False)
+            if input.save_csv():
+                result.to_df().to_csv(os.path.join(input.data_path(), 'result.csv'), index=False)
 
-            status_text.set(f"Pipeline completed successfully, results saved to {input.data_path()}/result.csv")
+            status_text.set(f"Pipeline completed successfully, results saved to {os.path.join(input.data_path(), 'result.csv')}")
         except Exception as e:
             status_text.set(f"Error: {e}")
             result_df.set(pd.DataFrame())
@@ -111,11 +135,25 @@ def server(input, output, session):
         else:
             return None
 
-
-if __name__ == "__main__":
-
-
+def main():
     app = App(app_ui, server)
 
-    shiny.run_app(app, port=8002)
+    def start_server():
+        shiny.run_app(app, port=61235)
+
+    threading.Thread(target=start_server, daemon=True).start()
+    time.sleep(1)
+    webbrowser.open("http://localhost:61235")
+
+    # Prevent the main thread from exiting
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("Shutting down...")
+
+
+if __name__ == "__main__":
+    main()
+
 

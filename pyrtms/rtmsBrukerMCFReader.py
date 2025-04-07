@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 class BatchProcessor:
     def __init__(self, reader, **kwargs):
         self.reader = reader
-        self.n_jobs = min(kwargs.get("n_jobs", mp.cpu_count()), 50)
+        self.n_jobs = min(kwargs.get("n_jobs", mp.cpu_count()), 60)
         self.show_progress = kwargs.get("show_progress", True)
 
     def calib_all_spectra(self, **kwargs) -> list:
@@ -757,7 +757,7 @@ def simple_calibration(spectrum_in: np.ndarray, return_shift=False,
 
 
 class Pipeline:
-    def __init__(self, reader):
+    def __init__(self, reader, **kwargs):
         self.reader = reader
         self.spots = None
         self.spectra = None
@@ -774,7 +774,7 @@ class Pipeline:
             "tol": 0.01,
             "min_snr": 0,
         }
-        self.batch_processor = BatchProcessor(reader)
+        self.batch_processor = BatchProcessor(reader, **kwargs)
 
     # function to set the parameters for calibration
     def set_calib_params(self, **kwargs):
@@ -884,6 +884,8 @@ class FinalResult:
     def viz2D(self):
         # add len(target_mzs) columns of subplots
         fig, axes = plt.subplots(1, len(self.results))
+        if len(self.results) == 1:
+            axes = [axes]
         for i, (mz, container) in enumerate(self.results.items()):
             x = self.get_x(container.spot_numbers)
             x = np.array(x).astype(int)
