@@ -3,6 +3,9 @@ import sqlite3
 
 import pandas as pd
 import numpy as np
+import re
+from dataclasses import dataclass
+from typing import List, Optional, Dict
 
 import struct
 import zlib
@@ -10,6 +13,70 @@ import multiprocessing as mp
 from pyopenms import MSSpectrum, PeakPickerHiRes
 from functools import partial
 
+from pyrtms.utils import peak_at
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="pyopenms")
+import matplotlib.pyplot as plt
+
+
+class BatchProcessor:
+    def __init__(self, reader, **kwargs):
+        self.reader = reader
+        self.n_jobs = min(kwargs.get("n_jobs", mp.cpu_count()), 50)
+        self.show_progress = kwargs.get("show_progress", True)
+
+    def calib_all_spectra(self, **kwargs) -> list:
+        """
+        calibrate all spectra in the spotTable
+        """
+        uncalib_line_spectra = self.pick_mul_spectra(self.reader.spotTable.index, **kwargs)
+        f = partial(simple_calibration, **kwargs, return_shift=True)
+
+        with mp.Pool(self.n_jobs) as pool:
+            if self.show_progress:
+                shifts = list(tqdm(pool.imap(f, [spectrum for spectrum in uncalib_line_spectra]),
+                                   total=len(uncalib_line_spectra)))
+            else:
+                shifts = pool.map(f, [spectrum for spectrum in uncalib_line_spectra])
+        self.reader.shifts = np.array(shifts)
+        self.reader.mean_shift = np.nanmean(self.reader.shifts)
+        return uncalib_line_spectra
+
+    def get_mul_spectra(self, indices, **kwargs):
+        f = partial(self.reader.get_spectrum, **kwargs)
+        with mp.Pool(self.n_jobs) as pool:
+            if self.show_progress:
+                results = list(tqdm(pool.imap(f, indices), total=len(indices)))
+            else:
+                results = pool.map(f, indices)
+        return results
+
+    def pick_mul_spectra(self, indices, **kwargs):
+
+        f = partial(self.reader.pick_spectrum, line_spec=None, **kwargs)
+
+        with mp.Pool(self.n_jobs) as pool:
+            if self.show_progress:
+                results = list(tqdm(pool.imap(f, indices), total=len(indices)))
+            else:
+                results = pool.map(f, indices)
+        return results
+
+    def pick_mul_from_uncalib_line_spectra(self, uncalib_line_spectra, **kwargs):
+
+        indices = self.reader.spotTable.index
+        f = partial(self.reader.pick_spectrum, **kwargs)
+        line_specs = [[None,uncalib_line_spectra[i] ]for i in indices]
+        # zip nones with the indices
+
+
+        with mp.Pool(self.n_jobs) as pool:
+            if self.show_progress:
+                results = list(tqdm(pool.starmap(f, line_specs), total=len(line_specs)))
+            else:
+                results = pool.starmap(f, line_specs)
+        return results
 
 
 class RtmsBrukerMCFReader:
@@ -94,51 +161,45 @@ class RtmsBrukerMCFReader:
                 metadata=metadata,
             )
 
-    def get_mul_spectra(self, indices,n_jobs=-1, show_progress=True):
-        if n_jobs == -1:
-            n_jobs = mp.cpu_count()
-        with mp.Pool(n_jobs) as pool:
-            if show_progress:
-                from tqdm import tqdm
-                results = list(tqdm(pool.imap(self.get_spectrum, indices), total=len(indices)))
-            else:
-                results = pool.map(self.get_spectrum, indices)
-        return results
+    def pick_spectrum(self, index=None, line_spec=None, **kwargs):
 
-    def pick_mul_spectra(self, indices, n_job=-1, show_progress=True, **kwargs):
-
-        f = partial(self.pick_spectrum, **kwargs)
-
-        if n_job == -1:
-            n_job = mp.cpu_count()
-        with mp.Pool(n_job) as pool:
-            if show_progress:
-                from tqdm import tqdm
-                results = list(tqdm(pool.imap(f, indices), total=len(indices)))
-            else:
-                results = pool.map(f, indices)
-        return results
-
-    def pick_spectrum(self, index, target_mzs = None, tol = 10, snr=0.0, intensity=1e6):
-        spec = self.get_spectrum(index)
-        spec = spec.sort_values("mz")
-        spec_obj = MSSpectrum()
-        spec_obj.set_peaks([spec.mz.to_numpy(), spec.intensity.to_numpy()])
-
-        picker = PeakPickerHiRes()
-        picker_params = picker.getParameters()
-        picker_params.setValue("signal_to_noise", float(snr))
-        picker.setParameters(picker_params)
-
-        res_spec = MSSpectrum()
-
-        picker.pick(spec_obj, res_spec)
-
-        mz, intensity = res_spec.get_peaks()
-
-        if target_mzs is None:
-            return pd.DataFrame({"mz": mz, "intensity": intensity})
+        if line_spec is not None:
+            mz = line_spec[:, 0]
+            intensity = line_spec[:, 1]
         else:
+            try:
+                snr = float(kwargs["min_snr"])
+            except KeyError:
+                raise KeyError("min_snr must be provided for peak picking")
+            spec = self.get_spectrum(index)
+            # sort spec by first column
+            spec = spec[np.argsort(spec[:, 0])]
+            spec_obj = MSSpectrum()
+            spec_obj.set_peaks([spec[:, 0], spec[:, 1]])
+
+            picker = PeakPickerHiRes()
+            picker_params = picker.getParameters()
+            picker_params.setValue("signal_to_noise", float(snr))
+            picker.setParameters(picker_params)
+
+            res_spec = MSSpectrum()
+
+            picker.pick(spec_obj, res_spec)
+
+            mz, intensity = res_spec.get_peaks()
+
+        if hasattr(self, "mean_shift"):
+            mz = mz - self.mean_shift
+
+        target_mzs = kwargs.get("target_mzs", None)
+        if target_mzs is None:
+            return np.column_stack([mz, intensity])
+        else:
+            try:
+                tol = float(kwargs["tol"])
+                min_intensity = float(kwargs["min_intensity"])
+            except KeyError:
+                raise KeyError("tol and min_intensity must be provided for picking specific peaks")
             result = []
             for target_mz in target_mzs:
                 if tol > 0.1:
@@ -146,17 +207,18 @@ class RtmsBrukerMCFReader:
                     mz_tol = target_mz * tol / 1e6
                 else:
                     mz_tol = tol
-                mask = (mz >= target_mz - mz_tol/2) & (mz <= target_mz + mz_tol/2)
+                mask1 = (mz >= target_mz - mz_tol / 2) & (mz <= target_mz + mz_tol / 2)
+                mask2 = intensity > min_intensity
+                mask = mask1 & mask2
                 # find the peak with the highest intensity within the tolerance
                 if np.sum(mask) > 0:
                     result.append(
                         [mz[mask][np.argmax(intensity[mask])],
-                        max(intensity[mask])]
+                         max(intensity[mask])]
                     )
                 else:
                     result.append([np.nan, np.nan])
-            return pd.DataFrame(result, columns=["mz", "intensity"])
-
+            return np.array(result)
 
     def get_spectrum(self, index, CASI_only=True):
         if index < 0 or index >= len(self.spotTable):
@@ -181,7 +243,7 @@ class RtmsBrukerMCFReader:
 
         # Seek to raw data blob
         blob_row = self.offsetTable[(self.offsetTable["id"] == spotId) &
-                                      (self.offsetTable["BlobResType"] == 258)].iloc[0]
+                                    (self.offsetTable["BlobResType"] == 258)].iloc[0]
         mcf_blobSeek(fcon, blob_row["Offset"], blob_row["OffsetPage"])
 
         mcf_checkBlobCodeWord(fcon)
@@ -213,9 +275,11 @@ class RtmsBrukerMCFReader:
         mz = np.array([indexToMass(i) for i in range(numValues)])
 
         if CASI_only:
-            spectrum = spectrum[(mz >= self.q1mass - self.q1res/2) & (mz <= self.q1mass + self.q1res/2)]
-            mz = mz[(mz >= self.q1mass - self.q1res/2) & (mz <= self.q1mass + self.q1res/2)]
-        return pd.DataFrame({"mz": mz, "intensity": spectrum})
+            spectrum = spectrum[(mz >= self.q1mass - self.q1res / 2) & (mz <= self.q1mass + self.q1res / 2)]
+            mz = mz[(mz >= self.q1mass - self.q1res / 2) & (mz <= self.q1mass + self.q1res / 2)]
+
+        # return np array of m/z and intensity combined
+        return np.column_stack((mz, spectrum))
 
     def get_metadata(self, index):
         blobRow = self.offsetTable[
@@ -283,10 +347,12 @@ def mcf_checkBlobCodeWord(fcon):
     expected = bytes([0xC0, 0xDE, 0xAF, 0xFE])
     bin_checkBytes(fcon, expected, "Invalid code word.")
 
+
 def bin_checkBytes(fcon, expected, message="Invalid bytes"):
     actual = fcon.read(len(expected))
     if actual != expected:
         raise ValueError(message)
+
 
 def mcf_readNamedName(fcon):
     first_byte = int.from_bytes(fcon.read(1), byteorder="big")
@@ -298,6 +364,7 @@ def mcf_readNamedName(fcon):
     namelen = int.from_bytes(fcon.read(1), byteorder="big")
     name_bytes = fcon.read(namelen)
     return name_bytes.decode("ascii")
+
 
 def bin_readVarInt(fcon, endian='little'):
     nums = []
@@ -314,6 +381,7 @@ def bin_readVarInt(fcon, endian='little'):
         if nextByte <= 127:
             break
     return sum(num * (128 ** i) for i, num in enumerate(nums))
+
 
 def mcf_readPrimitive(fcon):
     dataType = int.from_bytes(fcon.read(1), byteorder="big")
@@ -340,6 +408,7 @@ def mcf_readPrimitive(fcon):
     else:
         raise ValueError(f"Invalid primitive data type {dataType}.")
 
+
 def mcf_readNamedTableRow(fcon):
     numRowCells = int.from_bytes(fcon.read(1), byteorder='big')
     output = {}
@@ -363,6 +432,7 @@ def mcf_readNamedTableRow(fcon):
             output[name] = prim
 
     return output
+
 
 def readMCFCalibration(path, offsetTable):
     with open(path, "rb") as f:
@@ -397,11 +467,14 @@ def readMCFCalibration(path, offsetTable):
 
     return pd.DataFrame(caltab)
 
+
 def getBrukerMCFSpectrum(reader, index):
     return reader.get_spectrum(index)
 
+
 def getBrukerMCFSpots(reader):
     return reader.get_spots()
+
 
 def readBrukerMCFIndexFile(path, calibration=False):
     with sqlite3.connect(path) as conn:
@@ -449,11 +522,13 @@ def readBrukerMCFIndexFile(path, calibration=False):
 def newBrukerMCFReader(mcfdir):
     return RtmsBrukerMCFReader.from_dir(mcfdir)
 
+
 def mcf_blobSeek(fcon, offset, page):
     fcon.seek(0)
     if page > 0:
-        fcon.seek((2**31) * page, 1)  # move forward by N * 2^31 bytes
+        fcon.seek((2 ** 31) * page, 1)  # move forward by N * 2^31 bytes
     fcon.seek(offset, 1)  # then move forward by the within-page offset
+
 
 def mcf_readTableRow(fcon, namevec=None):
     numRowCells = int.from_bytes(fcon.read(1), byteorder="big")
@@ -479,6 +554,7 @@ def mcf_readTableRow(fcon, namevec=None):
 
     return output
 
+
 def mcf_readTable(fcon):
     bin_checkBytes(fcon, b"\x03\x01")
     fcon.seek(16, 1)  # skip 16 bytes
@@ -496,8 +572,10 @@ def mcf_readTable(fcon):
 
     return pd.DataFrame(outTable)
 
+
 def getBrukerMCFIndices(reader):
     return reader.spotTable.index
+
 
 def mcf_readPrimitiveArray(fcon):
     bin_checkBytes(fcon, b"\x03")  # array marker
@@ -527,6 +605,7 @@ def mcf_readPrimitiveArray(fcon):
         outVec.append(val)
 
     return outVec
+
 
 def retrieveMCFMetadata(fcon, offset, offsetPage=0):
     mcf_blobSeek(fcon, offset, offsetPage)
@@ -579,8 +658,10 @@ def retrieveMCFMetadata(fcon, offset, offsetPage=0):
 
     return {"declarations": outTable, "replacements": pd.DataFrame(valTable)}
 
+
 def getBrukerMCFAllMetadata(reader, index):
     return reader.get_metadata(index)
+
 
 def mcf_readKeyValueTable(fcon):
     bin_checkBytes(fcon, b"\x03\x01")
@@ -597,6 +678,7 @@ def mcf_readKeyValueTable(fcon):
         keyTable.append(curRow)
 
     return pd.DataFrame(keyTable)
+
 
 def mcf_readNamedKeyValueRow(fcon):
     bin_checkBytes(fcon, b"\x02", "Key-value row must contain two elements")
@@ -626,6 +708,7 @@ def mcf_readNamedKeyValueRow(fcon):
 
     return output
 
+
 def mcf_readKeyValueRow(fcon):
     bin_checkBytes(fcon, b"\x02", "Key-value row must contain two elements")
     output = {}
@@ -646,21 +729,184 @@ def mcf_readKeyValueRow(fcon):
 
     return output
 
-class BrukerMCFExporter:
+
+def simple_calibration(spectrum_in: np.ndarray, return_shift=False,
+                       **kwargs) -> float or np.ndarray:
+    """ simple calibration function that only shifts the spectrum left or right """
+
+    # find the highest peak within the specified mass tolerance around the calibrant m/z
+    target_mz, _ = peak_at(spectrum_in, **kwargs)
+
+    # if no peak found, return the original spectrum
+    if np.isnan(target_mz):
+        if return_shift:
+            return np.nan
+        else:
+            # if no peak found, return the original spectrum
+            return spectrum_in
+    else:
+        # calculate the shift
+        shift = target_mz - kwargs["mz"]
+        if return_shift:
+            return shift
+        else:
+            # apply the shift to the spectrum
+            spectrum_out = spectrum_in.copy()
+            spectrum_out[:, 0] -= shift
+            return spectrum_out
+
+
+class Pipeline:
     def __init__(self, reader):
         self.reader = reader
         self.spots = None
         self.spectra = None
+        self.calib_params = {
+            "mz": None,
+            "min_intensity": 1e5,
+            "tol": 0.02,
+            "min_snr": 0,
+        }
 
-        self.preprocess()
+        self.after_params = {
+            "target_mzs": None,
+            "min_intensity": 1e4,
+            "tol": 0.01,
+            "min_snr": 0,
+        }
+        self.batch_processor = BatchProcessor(reader)
 
-    def preprocess(self):
-        # get all spots
-        self.spots = self.reader.get_spots()
-        # get all spectra
-        self.spectra = self.reader.get_mul_spectra(self.spots.index)
+    # function to set the parameters for calibration
+    def set_calib_params(self, **kwargs):
+        self.calib_params.update(kwargs)
+
+    # function to set the parameters for after calibration
+    def set_after_params(self, **kwargs):
+        # if target_mzs is in kwargs, check if it is a list
+        if "target_mzs" in kwargs:
+            if not isinstance(kwargs["target_mzs"], list):
+                try:
+                    kwargs["target_mzs"] = list(kwargs["target_mzs"])
+                except TypeError:
+                    raise ValueError("target_mzs must be a list")
+        self.after_params.update(kwargs)
+
+    def process(self, **kwargs):
+        self.spots = self.reader.get_spots()['SpotNumber'].values
+
+        if "uncalib_line_spectra" in kwargs:
+            uncalib_line_spectra = kwargs["uncalib_line_spectra"]
+        else:
+            uncalib_line_spectra = self.batch_processor.calib_all_spectra(**self.calib_params)
+        self.spectra = self.batch_processor.pick_mul_from_uncalib_line_spectra(uncalib_line_spectra,
+                                                                               **self.after_params)
+        self.final_result = FinalResult()
+        for i, target_mz in enumerate(self.after_params["target_mzs"]):
+            mz_intensity = np.array([spectrum[i] for spectrum in self.spectra])
+            result = SingleResultContainer(target_mz,
+                                            mz_intensity[:, 0],
+                                            mz_intensity[:, 1],
+                                            self.spots)
+            self.final_result.append(result)
+        return uncalib_line_spectra
+
+    def plot_calibration(self):
+        fig, ax = plt.subplots()
+        ax.plot(self.reader.shifts)
+        ax.set_xlabel("Spot Number")
+        ax.set_ylabel("Mass Shift (Da)")
+        ax.set_title("Calibration Result")
+        ax.axhline(0, color='r', linestyle='--')
+        # add text show mean and std
+        mean = np.nanmean(self.reader.shifts)
+        std = np.nanstd(self.reader.shifts)
+        ax.text(0.5, 0.5, f"Mean: {1000 * mean:.2f} mDa\nStd: { 1000 * std:.2f} mDa", transform=ax.transAxes,
+                fontsize=12, verticalalignment='center', horizontalalignment='center')
+        return fig
+
+
+@dataclass
+class SingleResultContainer:
+    theoretical_mz: Optional[float] = None
+    measured_mzs: Optional[np.ndarray[float]] = None
+    intensities: Optional[np.ndarray[float]] = None
+    spot_numbers: Optional[List[str]] = None
+
+
+class FinalResult:
+    def __init__(self):
+        self.results: Dict[float, SingleResultContainer] = {}
+
+    def get_x(self, spot_numbers):
+        return [re.findall(r'X(\d+)', sn)[0] for sn in spot_numbers]
+
+    def get_y(self, spot_numbers):
+        return [re.findall(r'Y(\d+)', sn)[0] for sn in spot_numbers]
+
+    @property
+    def spot_numbers(self):
+        return self.results[list(self.results.keys())[0]].spot_numbers
+
+    @classmethod
+    def from_single_results(cls, containers: List[SingleResultContainer]) -> "FinalResult":
+        instance = cls()
+        for container in containers:
+            if not isinstance(container, SingleResultContainer):
+                raise ValueError("All elements must be SingleResultContainer")
+            if container.theoretical_mz is None:
+                raise ValueError("theoretical_mz cannot be None")
+            instance.results[container.theoretical_mz] = container
+        return instance
+
+    def result_for(self, mz: float) -> SingleResultContainer:
+        try:
+            return self.results[mz]
+        except KeyError:
+            raise ValueError(f"Result for {mz} not found.")
+
+    def append(self, container: SingleResultContainer):
+        if not isinstance(container, SingleResultContainer):
+            raise ValueError("container must be SingleResultContainer")
+        if container.theoretical_mz is None:
+            raise ValueError("theoretical_mz cannot be None")
+        self.results[container.theoretical_mz] = container
+
+    def to_df(self):
+        theoretical_mz_all = np.concatenate([[r.theoretical_mz] * len(r.measured_mzs)
+                                             for r in self.results.values()])
+        mz_all = np.concatenate([r.measured_mzs for r in self.results.values()])
+        intensity_all = np.concatenate([r.intensities for r in self.results.values()])
+        spot_all = np.concatenate([r.spot_numbers for r in self.results.values()])
+
+        data = np.column_stack((theoretical_mz_all, mz_all, intensity_all, spot_all))
+        return pd.DataFrame(data, columns=['theoretical_mz', 'mz', 'intensity', 'spot'])
+
+    def viz2D(self):
+        # add len(target_mzs) columns of subplots
+        fig, axes = plt.subplots(1, len(self.results))
+        for i, (mz, container) in enumerate(self.results.items()):
+            x = self.get_x(container.spot_numbers)
+            x = np.array(x).astype(int)
+            y = self.get_y(container.spot_numbers)
+            y = np.array(y).astype(int)
+
+            df = pd.DataFrame(
+                {'x': x,
+                 'y': y,
+                 'intensity': container.intensities
+                 })
+
+            axes[i].imshow(
+                df.pivot(index='x', columns='y', values='intensity').values,
+                vmax=df['intensity'].quantile(0.95)
+            )
+            # turn off all axes
+            axes[i].set_xticks([])
+            axes[i].set_yticks([])
+            axes[i].set_title(f'm/z {mz:.4f}')
+        return fig
+
 
 
 if __name__ == "__main__":
     pass
-
