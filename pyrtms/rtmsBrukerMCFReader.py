@@ -78,7 +78,6 @@ class BatchProcessor:
                 results = pool.starmap(f, line_specs)
         return results
 
-
 class RtmsBrukerMCFReader:
     def __init__(self, mcfdir, files, spotTable, offsetTable, metadata):
         assert isinstance(mcfdir, str), "dir must be a string"
