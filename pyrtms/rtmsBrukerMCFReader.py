@@ -234,9 +234,6 @@ class RtmsBrukerMCFReader:
         alpha = row["alpha"]
         beta = row["beta"]
 
-        def indexToMass(i):
-            return fhigh / ((fwidth * (fsize - i) / fsize) - beta) + alpha / fhigh
-
         # Seek to raw data blob
         blob_row = self.offsetTable[(self.offsetTable["id"] == spotId) &
                                     (self.offsetTable["BlobResType"] == 258)].iloc[0]
@@ -255,11 +252,9 @@ class RtmsBrukerMCFReader:
         typeByte = fcon.read(1)
 
         if typeByte == b"\x20":  # uncompressed 32-bit floats
-            compressed = False
             numValues = bin_readVarInt(fcon)
             spectrum = np.frombuffer(fcon.read(numValues * 4), dtype="<f4")
         elif typeByte == b"\x22":  # gzip-compressed
-            compressed = True
             numBytes = bin_readVarInt(fcon)
             gzippedBytes = fcon.read(numBytes)
             unzipped = zlib.decompress(gzippedBytes)
@@ -268,12 +263,15 @@ class RtmsBrukerMCFReader:
         else:
             raise ValueError("Raw spectra must be an array of 32-bit floats.")
 
-        mz = np.array(range(numValues))
-        mz = indexToMass(mz)
+        mzindex = np.arange(numValues)
+        mz = fhigh / ((fwidth * (fsize - mzindex) / fsize) - beta) + alpha / fhigh
 
         if CASI_only:
-            spectrum = spectrum[(mz >= self.q1mass - self.q1res / 2) & (mz <= self.q1mass + self.q1res / 2)]
-            mz = mz[(mz >= self.q1mass - self.q1res / 2) & (mz <= self.q1mass + self.q1res / 2)]
+            lower = self.q1mass - self.q1res / 2
+            upper = self.q1mass + self.q1res / 2
+            mask = (mz >= lower) & (mz <= upper)
+            spectrum = spectrum[mask]
+            mz = mz[mask]
 
         # return np array of m/z and intensity combined
         return np.column_stack((mz, spectrum))
