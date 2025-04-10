@@ -172,9 +172,8 @@ class RtmsBrukerMCFReader:
                 raise KeyError("min_snr must be provided for peak picking")
             spec = self.get_spectrum(index)
             # sort spec by first column
-            spec = spec[np.argsort(spec[:, 0])]
             spec_obj = MSSpectrum()
-            spec_obj.set_peaks([spec[:, 0], spec[:, 1]])
+            spec_obj.set_peaks([spec[0], spec[1]])
 
             picker = PeakPickerHiRes()
             picker_params = picker.getParameters()
@@ -274,7 +273,7 @@ class RtmsBrukerMCFReader:
             mz = mz[mask]
 
         # return np array of m/z and intensity combined
-        return np.column_stack((mz, spectrum))
+        return mz, spectrum
 
     def get_metadata(self, index):
         blobRow = self.offsetTable[
