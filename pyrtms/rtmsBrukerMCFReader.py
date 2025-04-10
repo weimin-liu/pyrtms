@@ -219,7 +219,7 @@ class RtmsBrukerMCFReader:
                     result.append([np.nan, np.nan])
             return np.array(result)
 
-    def get_spectrum(self, index, CASI_only=True):
+    def get_spectrum(self, index, CASI_only=False):
         if index < 0 or index >= len(self.spotTable):
             raise IndexError("Index out of bounds")
 
@@ -233,9 +233,6 @@ class RtmsBrukerMCFReader:
         fsize = row["size"]
         alpha = row["alpha"]
         beta = row["beta"]
-
-        def massToIndex(p):
-            return fsize * (fwidth - (fhigh / (p - alpha / fhigh) + beta)) / fwidth
 
         def indexToMass(i):
             return fhigh / ((fwidth * (fsize - i) / fsize) - beta) + alpha / fhigh
@@ -271,7 +268,8 @@ class RtmsBrukerMCFReader:
         else:
             raise ValueError("Raw spectra must be an array of 32-bit floats.")
 
-        mz = np.array([indexToMass(i) for i in range(numValues)])
+        mz = np.array(range(numValues))
+        mz = indexToMass(mz)
 
         if CASI_only:
             spectrum = spectrum[(mz >= self.q1mass - self.q1res / 2) & (mz <= self.q1mass + self.q1res / 2)]
