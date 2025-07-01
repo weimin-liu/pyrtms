@@ -264,7 +264,10 @@ class RtmsBrukerMCFReader:
                     result.append([np.nan, np.nan])
             return np.array(result)
 
-    def get_spectrum(self, index, CASI_only=False, return_mzs=True):
+    def get_spectrum(self, index, CASI_only=False, return_mzs=True, intensities_only=False):
+        if intensities_only:
+            return_mzs = False # to be compatible with maspim
+
         if index < 0 or index >= len(self.spotTable):
             raise IndexError("Index out of bounds")
 
