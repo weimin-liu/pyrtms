@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 
 import struct
 import zlib
@@ -18,6 +18,22 @@ from tqdm import tqdm
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="pyopenms")
 import matplotlib.pyplot as plt
+import h5py
+
+
+def write_intensities_to_hdf5(data:List[Tuple[np.array, np.array]], path, **kwargs):
+    if os.path.exists(path):
+        raise FileExistsError(path)
+    with h5py.File(path, "w") as f:
+        dset = f.create_dataset(
+            'intensities',
+            shape=(len(data), len(data[0][0])),
+            dtype='float64',
+            chunks=(1, len(data[0][0])),
+            kwargs=kwargs,
+        )
+        for i, spectrum in enumerate(data):
+            dset[i, :] = spectrum[1]
 
 
 class BatchProcessor:
@@ -67,6 +83,15 @@ class BatchProcessor:
 
         indices = self.reader.spotTable.index
         f = partial(self.reader.pick_spectrum, **kwargs)
+
+        # calibrate the line spectra
+        if hasattr(self.reader, "mean_shift"):
+            for i in range(len(uncalib_line_spectra)):
+                if np.isnan(self.reader.shifts[i]):
+                    uncalib_line_spectra[i][:, 0] -= self.reader.mean_shift
+                else:
+                    uncalib_line_spectra[i][:, 0] -= self.reader.shifts[i]
+
         line_specs = [[None,uncalib_line_spectra[i] ]for i in indices]
         # zip nones with the indices
 
@@ -92,6 +117,24 @@ class RtmsBrukerMCFReader:
         self.offsetTable = offsetTable
         self.metadata = metadata
         self.spots = None
+
+    @property
+    def mzs(self):
+        return self.get_spectrum(0, return_mzs=True)[0]
+
+    @property
+    def str_xy(self):
+        return self.get_spots()['SpotNumber'].values
+
+    @property
+    def xy(self):
+        spot_x = [re.findall(r"X(\d+)", str(spot))[0] for spot in self.str_xy]
+        spot_x = [int(x) for x in spot_x]
+        spot_y = [re.findall(r"Y(\d+)", str(spot))[0] for spot in self.str_xy]
+        spot_y = [int(y) for y in spot_y]
+        spot = np.column_stack((spot_x, spot_y))
+        return spot
+
 
     @property
     def metadataDF(self):
@@ -186,8 +229,11 @@ class RtmsBrukerMCFReader:
 
             mz, intensity = res_spec.get_peaks()
 
-        if hasattr(self, "mean_shift"):
-            mz = mz - self.mean_shift
+
+        # if 'shift' in kwargs:
+        #     mz = mz - kwargs['shift']
+        # elif hasattr(self, "mean_shift"):
+        #     mz = mz - self.mean_shift
 
         target_mzs = kwargs.get("target_mzs", None)
         if target_mzs is None:
@@ -218,20 +264,13 @@ class RtmsBrukerMCFReader:
                     result.append([np.nan, np.nan])
             return np.array(result)
 
-    def get_spectrum(self, index, CASI_only=False):
+    def get_spectrum(self, index, CASI_only=False, return_mzs=True):
         if index < 0 or index >= len(self.spotTable):
             raise IndexError("Index out of bounds")
 
         fcon = self.con
         row = self.spotTable.iloc[index]
-
-        # the following parameters derived from spotTable are the calibrated parameters.
         spotId = row["id"]
-        fhigh = row["frequencyHigh"]
-        fwidth = row["frequencyWidth"]
-        fsize = row["size"]
-        alpha = row["alpha"]
-        beta = row["beta"]
 
         # Seek to raw data blob
         blob_row = self.offsetTable[(self.offsetTable["id"] == spotId) &
@@ -262,16 +301,28 @@ class RtmsBrukerMCFReader:
         else:
             raise ValueError("Raw spectra must be an array of 32-bit floats.")
 
-        mzindex = np.arange(numValues)
-        mz = fhigh / ((fwidth * (fsize - mzindex) / fsize) - beta) + alpha / fhigh
 
-        if CASI_only:
-            lower = self.q1mass - self.q1res / 2
-            upper = self.q1mass + self.q1res / 2
-            mask = (mz >= lower) & (mz <= upper)
-            spectrum = spectrum[mask]
-            mz = mz[mask]
+        if return_mzs:
+            # the following parameters derived from spotTable are the calibrated parameters.
+            fhigh = row["frequencyHigh"]
+            fwidth = row["frequencyWidth"]
+            fsize = row["size"]
+            alpha = row["alpha"]
+            beta = row["beta"]
 
+
+            mzindex = np.arange(numValues)
+            mz = fhigh / ((fwidth * (fsize - mzindex) / fsize) - beta) + alpha / fhigh
+
+            if CASI_only:
+                lower = self.q1mass - self.q1res / 2
+                upper = self.q1mass + self.q1res / 2
+                mask = (mz >= lower) & (mz <= upper)
+                spectrum = spectrum[mask]
+                mz = mz[mask]
+        else:
+            # if return_mzs is False, return the spectrum only
+            mz = np.zeros(numValues)
         # return np array of m/z and intensity combined
         return mz, spectrum
 
@@ -874,6 +925,22 @@ class FinalResult:
 
         data = np.column_stack((theoretical_mz_all, mz_all, intensity_all, spot_all))
         return pd.DataFrame(data, columns=['theoretical_mz', 'mz', 'intensity', 'spot'])
+
+    def to_str(self):
+        result = self.to_df()
+        result = result.dropna()
+        result['snr'] = 0
+        result_str = f"{len(result['spot'].unique())}\n"
+        for spot in result['spot'].unique().tolist():
+            subresult = result.query("spot == @spot")
+            n_peaks = subresult['theoretical_mz'].unique().size
+            result_str += f"{spot};{n_peaks}"
+            # concat the rows to string
+            for index, row in subresult.iterrows():
+                result_str += f";{row['mz']:.4f};{row['intensity']:.4f};{row['snr']:.4f}"
+            result_str += "\n"
+        return result_str
+
 
     def viz2D(self):
         # add len(target_mzs) columns of subplots

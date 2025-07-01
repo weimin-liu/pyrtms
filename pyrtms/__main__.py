@@ -10,27 +10,41 @@ import h5py
 import numpy as np
 
 # Assume your reader and pipeline are in the same folder or in your PYTHONPATH
-from pyrtms.rtmsBrukerMCFReader import RtmsBrukerMCFReader, Pipeline, BatchProcessor
+from pyrtms.rtmsBrukerMCFReader import RtmsBrukerMCFReader, Pipeline, BatchProcessor, write_intensities_to_hdf5
 import threading
 import time
 import webbrowser
 
 app_ui = ui.page_fluid(
     ui.h2("RTMS Data Processor"),
-    ui.layout_columns(
-        ui.input_text("data_path", "Enter path to Bruker .d folder"),
-            ui.input_numeric(
-                "n_jobs",
-                "Number of parallel jobs",
-                value=mp.cpu_count(),
-            ),
+    ui.input_text("data_path", "Enter path to Bruker .d folder"),
+    ui.input_numeric(
+        "n_jobs",
+        "Number of parallel jobs",
+        value=mp.cpu_count(),
+
+    ),
+    ui.card(
+        ui.card_header("Convert to HDF5"),
+
+        ui.input_text(
+            "hdf5_path",
+            "HDF5 file path",
+            value=os.path.join(os.getcwd(), "data.h5"),
+        ),
+        ui.input_numeric(
+            "compression_opts",
+            "Compression level (0-9)",
+            value=1,
+        ),
         ui.input_action_button(
             "to_hdf5",
             "Convert to HDF5",
             class_="btn-primary",
-        )
-    ),
+            width='20%',
+        ),
 
+    ),
     ui.card(
         ui.card_header("Calibration Parameters"),
             ui.layout_columns(
@@ -88,39 +102,35 @@ def server(input, output, session):
 
         try:
             reader = RtmsBrukerMCFReader.from_dir(str(input.data_path()))
-            spotnumbers = reader.get_spots()['SpotNumber'].values
-            spot_x = [re.findall(r"X(\d+)", str(spot))[0] for spot in spotnumbers]
-            spot_x = [int(x) for x in spot_x]
-            spot_y = [re.findall(r"Y(\d+)", str(spot))[0] for spot in spotnumbers]
-            spot_y = [int(y) for y in spot_y]
 
-            spot = np.column_stack((spot_x, spot_y))
+            dfilename = os.path.basename(input.data_path())
+            hdf5_path = os.path.join(input.hdf5_path(), dfilename.replace('.d', ''))
 
+            xy_ = reader.xy
+            mzs_ = reader.mzs
+            with h5py.File(hdf5_path+'.h5', 'w') as f:
+                # Create a dataset for the mzs
+                f.create_dataset('mzs',
+                                 data=mzs_,
+                                 )
+
+                # Create a dataset for the xy
+                f.create_dataset('xy',
+                                 data=xy_,
+                                 )
             # conver every 2000 spectra to HDF5
-            for i in range(0, len(reader.spotTable.index), 2000):
+            for i in range(0, len(xy_), 2000):
                 part_spectra = BatchProcessor(reader,
                                              n_jobs=input.n_jobs(),
+                                             return_mzs=False,
                                              show_progress=False,
                                              ).get_mul_spectra(reader.spotTable.index[i:i + 2000])
-                with h5py.File(os.path.join(input.data_path(), f"data_{i // 2000}.h5"), "w") as f:
-                    dset = f.create_dataset(
-                        'intensities',
-                        shape=(len(reader.spotTable.index), part_spectra[0].shape[0]),
-                        dtype='int64',
-                        chunks=(1, part_spectra[0].shape[0]),
-                    )
-                    for i, spectrum in enumerate(part_spectra):
-                        dset[i, :] = spectrum[:,1]
-                    if i//2000 == 0:
-                        f.create_dataset("spot",
-                                         data=spot)
-                        f.create_dataset(
-                            'mzs',
-                            data=part_spectra[0][:, 0],
-                            dtype='float64',
-                        )
+                write_intensities_to_hdf5(part_spectra,
+                                          f'{hdf5_path}_{i // 2000}.h5',
+                                          )
 
-            status_text.set(f"Data converted to HDF5 and saved to {os.path.join(input.data_path(), 'data.h5')}")
+
+            status_text.set(f"Data converted to HDF5 and saved to {os.path.join(input.data_path())}")
         except Exception as e:
             status_text.set(f"Error: {e}")
 
@@ -134,6 +144,7 @@ def server(input, output, session):
 
         try:
             reader = RtmsBrukerMCFReader.from_dir(str(input.data_path()))
+            basename = os.path.basename(input.data_path())
             pipe = Pipeline(reader, n_jobs=input.n_jobs())
             pipe.set_calib_params(mz=input.mz(),
                                   tol=input.tol1(),
@@ -155,7 +166,9 @@ def server(input, output, session):
             # save the DataFrame to a CSV file
             if input.save_csv():
                 result.to_df().to_csv(os.path.join(input.data_path(), 'result.csv'), index=False)
-
+                result_str = str(result.to_str())
+                with open(os.path.join(input.data_path(), f'{basename}.txt'), 'w') as f:
+                    f.write(result_str)
             status_text.set(f"Pipeline completed successfully, results saved to {os.path.join(input.data_path(), 'result.csv')}")
         except Exception as e:
             status_text.set(f"Error: {e}")
