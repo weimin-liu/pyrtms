@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict
 
 import struct
 import zlib
