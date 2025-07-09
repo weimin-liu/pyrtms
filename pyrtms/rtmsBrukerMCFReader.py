@@ -118,6 +118,9 @@ class RtmsBrukerMCFReader:
         self.metadata = metadata
         self.spots = None
 
+    def __len__(self):
+        return len(self.get_spots()['SpotNumber'].values)
+
     @property
     def mzs(self):
         return self.get_spectrum(0, return_mzs=True)[0]
@@ -265,7 +268,7 @@ class RtmsBrukerMCFReader:
             return np.array(result)
 
     def get_spectrum(self, index, CASI_only=False, return_mzs=None, intensities_only=None):
-        
+
         if return_mzs is not None and intensities_only is not None:
             raise ValueError("Only one of return_mzs or intensities_only should be provided")
 
@@ -330,6 +333,7 @@ class RtmsBrukerMCFReader:
         else:
             # if return_mzs is False, return the spectrum only
             mz = np.zeros(numValues)
+
         # return np array of m/z and intensity combined
         return mz, spectrum
 
