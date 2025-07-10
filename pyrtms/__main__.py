@@ -1,5 +1,3 @@
-import re
-
 from shiny import App, ui, reactive, render
 import pandas as pd
 import os
@@ -7,10 +5,11 @@ import shiny
 import matplotlib.pyplot as plt
 import multiprocessing as mp
 import h5py
-import numpy as np
 
-# Assume your reader and pipeline are in the same folder or in your PYTHONPATH
-from pyrtms.rtmsBrukerMCFReader import RtmsBrukerMCFReader, Pipeline, BatchProcessor, write_intensities_to_hdf5
+try:
+    from pyrtms.rtmsBrukerMCFReader import RtmsBrukerMCFReader, Pipeline, BatchProcessor, write_intensities_to_hdf5
+except ImportError:
+    from rtmsBrukerMCFReader import RtmsBrukerMCFReader, Pipeline, BatchProcessor, write_intensities_to_hdf5
 import threading
 import time
 import webbrowser

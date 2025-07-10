@@ -9,8 +9,15 @@ from shinywidgets import output_widget, render_widget
 import plotly.express as px
 import pandas as pd
 
+try:
+    from pyrtms.utils import get_mirror_folder
+except ImportError:
+    from utils import get_mirror_folder
 
-from pyrtms.mz_finder import Config, profile_to_line, get_kde_curve, get_target_mz, get_eic
+try:
+    from pyrtms.mz_finder import Config, profile_to_line, get_kde_curve, get_target_mz, get_eic, load_xy_spots
+except ImportError:
+    from mz_finder import Config, profile_to_line, get_kde_curve, get_target_mz, get_eic, load_xy_spots
 
 app_ui = ui.page_fluid(
     ui.card(
@@ -52,7 +59,8 @@ def server(input, output, session):
     @reactive.event(input.load_d)
     def calculate_kde_on_mz():
         if not os.path.exists(os.path.join(input.data_path(), mass_spec_config.line_spectra_filename)):
-            profile_to_line(input.data_path(), mass_spec_config)
+            if not os.path.exists(os.path.join(get_mirror_folder(input.data_path(), mass_spec_config), mass_spec_config.line_spectra_filename)):
+                profile_to_line(input.data_path(), mass_spec_config)
         x, y = get_kde_curve(input.data_path(), mass_spec_config)
         x_val.set(x)
         y_val.set(y)
@@ -65,9 +73,14 @@ def server(input, output, session):
             kde_fig_to_display.set(fig)
         if input.create_eic():
             eic.set(get_eic(measured_mz, measured_da_tol, input.data_path(), mass_spec_config))
-            np.savez_compressed(os.path.join(input.data_path(), f'mz_{input.target_mz()}.npz'),eic.get())
+            try:
+                np.savez_compressed(os.path.join(input.data_path(), f'mz_{input.target_mz()}.npz'),eic.get())
+            except PermissionError:
+                np.savez_compressed(os.path.join(get_mirror_folder(input.data_path(),mass_spec_config),
+                                                 f'mz_{input.target_mz()}.npz'),
+                                    eic.get())
         if input.plot_eic():
-            xy_spots = np.load(os.path.join(input.data_path(), mass_spec_config.xy_spots_filename))['arr_0']
+            xy_spots = load_xy_spots(input.data_path(), mass_spec_config)
 
             im = pd.DataFrame(data=xy_spots, columns=['x', 'y'])
             im['z'] = eic.get()[:,1]
@@ -106,7 +119,7 @@ def main():
     app = App(app_ui, server)
 
     def start_server():
-        run_app(app, port=61235)
+        run_app(app, host='0.0.0.0', port=61235)
 
     threading.Thread(target=start_server, daemon=True).start()
     time.sleep(1)

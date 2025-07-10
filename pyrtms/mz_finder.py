@@ -1,6 +1,14 @@
 from pyopenms import MSSpectrum, PeakPickerHiRes
 import multiprocessing
-from pyrtms.rtmsBrukerMCFReader import RtmsBrukerMCFReader
+try:
+    from pyrtms.utils import get_mirror_folder
+except ImportError:
+    from utils import get_mirror_folder
+
+try:
+    from pyrtms.rtmsBrukerMCFReader import RtmsBrukerMCFReader
+except ImportError:
+    from rtmsBrukerMCFReader import RtmsBrukerMCFReader
 import plotly.express as px
 import plotly.graph_objects as go
 import tqdm
@@ -9,8 +17,6 @@ from dataclasses import dataclass
 import itertools
 import numpy as np
 from KDEpy import FFTKDE
-from scipy.signal import find_peaks
-from scipy.stats import norm
 from scipy.optimize import curve_fit
 import os
 
@@ -30,6 +36,8 @@ class Config:
     line_spectra_filename: str = "line_spectra.npz"
     xy_spots_filename: str = "xy_spots.npz"
 
+    mirror_folder: str = r"D:/14TC"
+
 
 def main(d_path):
     config = Config()
@@ -47,9 +55,11 @@ def main(d_path):
 def profile_to_line(d_path, config: Config):
     spectra = RtmsBrukerMCFReader.from_dir(d_path)
     xy_spots = spectra.xy
-    np.savez_compressed(os.path.join(d_path, config.xy_spots_filename), xy_spots)
     specs = []
-    raw_mzs = spectra.get_spectrum(0, return_mzs=True)[0]
+    try:
+        raw_mzs = spectra.get_spectrum(0, return_mzs=True)[0]
+    except IndexError:
+        raise IndexError(f"{d_path} is corrupt")
 
     CASI_mask = (raw_mzs >= spectra.q1mass - spectra.q1res / 2) & (raw_mzs <= spectra.q1mass + spectra.q1res / 2)
 
@@ -64,8 +74,15 @@ def profile_to_line(d_path, config: Config):
 
     if config.save_line_spectra:
         # get the parent path of d_path:
-        np.savez(os.path.join(d_path,config.line_spectra_filename), *results)
-        print(f'Line spectra saved to {os.path.join(d_path, config.line_spectra_filename)}')
+        try:
+            np.savez(os.path.join(d_path,config.line_spectra_filename), *results)
+            np.savez_compressed(os.path.join(d_path, config.xy_spots_filename), xy_spots)
+            print(f'Line spectra saved to {os.path.join(d_path, config.line_spectra_filename)}')
+        except PermissionError:
+            np.savez(os.path.join(get_mirror_folder(d_path,config),config.line_spectra_filename), *results)
+            np.savez_compressed(os.path.join(get_mirror_folder(d_path,config),config.xy_spots_filename), xy_spots)
+            print(f'Line spectra saved to {os.path.join(get_mirror_folder(d_path,config),config.line_spectra_filename)}')
+
 
 def process_spectrum(profile_mz, profile_intensity, config: Config):
     # sort spec by first column
@@ -85,7 +102,7 @@ def process_spectrum(profile_mz, profile_intensity, config: Config):
     return mz, intensity
 
 def get_kde_curve(d_path, config: Config):
-    line_spectra = np.load(os.path.join(d_path, config.line_spectra_filename))
+    line_spectra = load_line_spectra(d_path, config)
     mzs_all = [
         mzs
         for key in line_spectra.files
@@ -141,7 +158,7 @@ def get_target_mz(target_mz, x_val, y_val, config: Config, plot=False):
 
 def get_eic(measured_mz, measured_da_tol, d_path, config: Config):
     picked_results = []
-    line_spectra = np.load(os.path.join(d_path, config.line_spectra_filename))
+    line_spectra = load_line_spectra(d_path, config)
     for key in line_spectra.files:
         result = line_spectra[key]
         mask = (result[0] > measured_mz - measured_da_tol) & (result[0] < measured_mz + measured_da_tol)
@@ -159,9 +176,26 @@ def get_eic(measured_mz, measured_da_tol, d_path, config: Config):
 def gaussian(x, mean, stddev):
     return np.exp(-((x - mean) / stddev)**2 / 2)
 
+def load_line_spectra(d_path, config):
+    if os.path.exists(os.path.join(d_path, config.line_spectra_filename)):
+        line_spectra = np.load(os.path.join(d_path, config.line_spectra_filename))
+    elif os.path.exists(os.path.join(get_mirror_folder(d_path,config),config.line_spectra_filename)):
+        line_spectra = np.load(os.path.join(get_mirror_folder(d_path,config),config.line_spectra_filename))
+    else:
+        raise ValueError('Could not find line spectra')
+    return line_spectra
+
+def load_xy_spots(d_path, config):
+    if os.path.exists(os.path.join(d_path, config.xy_spots_filename)):
+        xy_spots = np.load(os.path.join(d_path, config.xy_spots_filename))['arr_0']
+    elif os.path.exists(os.path.join(get_mirror_folder(d_path,config),config.xy_spots_filename)):
+        xy_spots = np.load(os.path.join(get_mirror_folder(d_path,config),config.xy_spots_filename))['arr_0']
+    else:
+        raise ValueError('Could not find xy_spots')
+    return xy_spots
 
 if __name__ == "__main__":
-    test = main('/Users/weimin/Projects/SBB14TC/test/MV0811-14TC_28-33_Q1_480_w160_75DR.d')
+    pass
 
 
 

@@ -13,7 +13,10 @@ import multiprocessing as mp
 from pyopenms import MSSpectrum, PeakPickerHiRes
 from functools import partial
 
-from pyrtms.utils import peak_at
+try:
+    from pyrtms.utils import peak_at
+except ImportError:
+    from utils import peak_at
 from tqdm import tqdm
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="pyopenms")
