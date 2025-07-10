@@ -119,11 +119,11 @@ def main():
     app = App(app_ui, server)
 
     def start_server():
-        run_app(app, host='0.0.0.0', port=61235)
+        run_app(app, host='0.0.0.0', port=61234)
 
     threading.Thread(target=start_server, daemon=True).start()
     time.sleep(1)
-    webbrowser.open("http://localhost:61235")
+    webbrowser.open("http://localhost:61234")
 
     # Prevent the main thread from exiting
     try:

@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from pyopenms import MSSpectrum, PeakPickerHiRes
 import multiprocessing
 try:
@@ -23,6 +25,7 @@ import os
 @dataclass
 class Config:
     n_jobs: int = 8
+    max_threads_reading_MCF: int = 16
     peak_width: float = 0.001
     peak_snr: float = 0.5
     sampling_points: int = 102400
@@ -63,9 +66,15 @@ def profile_to_line(d_path, config: Config):
 
     CASI_mask = (raw_mzs >= spectra.q1mass - spectra.q1res / 2) & (raw_mzs <= spectra.q1mass + spectra.q1res / 2)
 
-    for i in tqdm.tqdm(range(len(spectra))):
+    def process_one(i):
         spec = spectra.get_spectrum(i, return_mzs=False)
-        specs.append(spec[1][CASI_mask])
+        return spec[1][CASI_mask]
+
+    with ThreadPoolExecutor(max_workers=config.max_threads_reading_MCF) as executor:
+        specs = list(tqdm.tqdm(
+            executor.map(process_one, range(len(spectra))),
+            total=len(spectra)
+        ))
 
     mzs = raw_mzs[CASI_mask]
 

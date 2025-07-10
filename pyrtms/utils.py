@@ -32,9 +32,11 @@ def peak_at(spectrum: np.ndarray, mz: float, **kwargs) -> np.ndarray:
         return np.array([np.nan, np.nan])
 
 def get_mirror_folder(d_path, config):
-    assert os.path.exists(config.mirror_folder)
-    d_name = os.path.basename(d_path)
-    mirror_folder = os.path.join(config.mirror_folder, d_name)
-    if not os.path.exists(mirror_folder):
-        os.makedirs(mirror_folder)
-    return mirror_folder
+    if os.path.exists(config.mirror_folder):
+        d_name = os.path.basename(d_path)
+        mirror_folder = os.path.join(config.mirror_folder, d_name)
+        if not os.path.exists(mirror_folder):
+            os.makedirs(mirror_folder)
+        return mirror_folder
+    else:
+        return d_path
