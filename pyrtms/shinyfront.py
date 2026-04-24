@@ -15,9 +15,9 @@ except ImportError:
     from utils import get_mirror_folder
 
 try:
-    from pyrtms.mz_finder import Config, profile_to_line, get_kde_curve, get_target_mz, get_eic, load_xy_spots
+    from pyrtms.mz_finder import Config, profile_to_line, get_kde_curve, get_target_mz, get_eic, load_xy_spots, simple_mz_calc
 except ImportError:
-    from mz_finder import Config, profile_to_line, get_kde_curve, get_target_mz, get_eic, load_xy_spots
+    from mz_finder import Config, profile_to_line, get_kde_curve, get_target_mz, get_eic, load_xy_spots, simple_mz_calc
 
 app_ui = ui.page_fluid(
     ui.card(
@@ -29,7 +29,9 @@ app_ui = ui.page_fluid(
     ui.card(
         ui.card_header('Get measured m/z'),
     ui.row(
-ui.column(5, ui.input_numeric('target_mz',label='Target m/z', value=None),
+ui.column(5,
+          ui.input_numeric('target_mz',label='Target m/z', value=None),
+          ui.input_text('formula',label='formula', value=None),
     ui.row(
     ui.column(2, ui.input_action_button('get_measured_mz', label='Go')),
     ui.column(3,
@@ -68,16 +70,29 @@ def server(input, output, session):
     @reactive.effect
     @reactive.event(input.get_measured_mz)
     def calculate_measured_mz_on_target_mz():
-        measured_mz, measured_da_tol, fig = get_target_mz(input.target_mz(), x_val.get(), y_val.get(), mass_spec_config, plot=True)
+        if input.formula() is not None:
+            mz_calculated = round(simple_mz_calc(input.formula()), mass_spec_config.mz_decimal_points)
+            ui.update_numeric(
+                'target_mz',
+                value=mz_calculated,
+            )
+        else:
+            assert input.target_mz is not None
+            mz_calculated = input.target_mz()
+        try:
+            measured_mz, measured_da_tol, fig = get_target_mz(mz_calculated, x_val.get(), y_val.get(), mass_spec_config, plot=True)
+        except ValueError as e:
+            print(e)
+            return
         if input.plot_kde_mz():
             kde_fig_to_display.set(fig)
         if input.create_eic():
             eic.set(get_eic(measured_mz, measured_da_tol, input.data_path(), mass_spec_config))
             try:
-                np.savez_compressed(os.path.join(input.data_path(), f'mz_{input.target_mz()}.npz'),eic.get())
+                np.savez_compressed(os.path.join(input.data_path(), f'mz_{mz_calculated}.npz'),eic.get())
             except PermissionError:
                 np.savez_compressed(os.path.join(get_mirror_folder(input.data_path(),mass_spec_config),
-                                                 f'mz_{input.target_mz()}.npz'),
+                                                 f'mz_{mz_calculated}.npz'),
                                     eic.get())
         if input.plot_eic():
             xy_spots = load_xy_spots(input.data_path(), mass_spec_config)
@@ -123,7 +138,7 @@ def main():
 
     threading.Thread(target=start_server, daemon=True).start()
     time.sleep(1)
-    webbrowser.open("http://localhost:61234")
+    #webbrowser.open("http://localhost:61234")
 
     # Prevent the main thread from exiting
     try:
