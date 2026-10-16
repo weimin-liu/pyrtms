@@ -1,3 +1,4 @@
+import mmap
 import os
 import sqlite3
 
@@ -8,10 +9,13 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Tuple
 
 import struct
+import threading
+from collections import OrderedDict
 import zlib
 import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor
 from pyopenms import MSSpectrum, PeakPickerHiRes
-from functools import partial
+from functools import partial, cached_property
 
 try:
     from pyrtms.utils import peak_at
@@ -24,7 +28,40 @@ import matplotlib.pyplot as plt
 import h5py
 
 
+print('with better multithreading')
 BLOB_CODE_WORD = bytes([0xC0, 0xDE, 0xAF, 0xFE])
+
+# number of distinct m/z axes (calibrations) kept per reader
+MZ_CACHE_SIZE = 8
+_MZ_CACHE_LOCK = threading.Lock()
+
+
+class _MMapCursor:
+    """Minimal file-like reader over a shared buffer with its own position."""
+
+    __slots__ = ("buf", "pos")
+
+    def __init__(self, buf):
+        self.buf = buf
+        self.pos = 0
+
+    def read(self, n=-1):
+        end = len(self.buf) if n < 0 else self.pos + n
+        data = self.buf[self.pos:end]
+        self.pos += len(data)
+        return data
+
+    def seek(self, offset, whence=0):
+        if whence == 0:
+            self.pos = offset
+        elif whence == 1:
+            self.pos += offset
+        else:
+            self.pos = len(self.buf) + offset
+        return self.pos
+
+    def tell(self):
+        return self.pos
 
 
 def write_intensities_to_hdf5(data:List[Tuple[np.array, np.array]], path, **kwargs):
@@ -42,11 +79,41 @@ def write_intensities_to_hdf5(data:List[Tuple[np.array, np.array]], path, **kwar
             dset[i, :] = spectrum[1]
 
 
+# reading is limited by disk access, more threads than this do not help
+MAX_READ_THREADS = 16
+
+# reader instance of a worker process, set once by the pool initializer instead of pickling it with every task
+_worker_reader: 'RtmsBrukerMCFReader' = None
+
+
+def _init_worker(reader: 'RtmsBrukerMCFReader'):
+    global _worker_reader
+    _worker_reader = reader
+
+
+def _pick_spectrum_worker(args):
+    index, line_spec, kwargs = args
+    return _worker_reader.pick_spectrum(index, line_spec=line_spec, **kwargs)
+
+
 class BatchProcessor:
     def __init__(self, reader, **kwargs):
         self.reader = reader
         self.n_jobs = min(kwargs.get("n_jobs", mp.cpu_count()), 60)
         self.show_progress = kwargs.get("show_progress", True)
+
+    def _map(self, func, args, initializer=None, initargs=()):
+        """pool.imap in chunks, with optional progress bar"""
+        args = list(args)
+        chunksize = max(1, len(args) // (self.n_jobs * 4))
+        with mp.Pool(self.n_jobs, initializer=initializer, initargs=initargs) as pool:
+            results = pool.imap(func, args, chunksize=chunksize)
+            if self.show_progress:
+                results = tqdm(results, total=len(args))
+            return list(results)
+
+    def _pick_map(self, args):
+        return self._map(_pick_spectrum_worker, args, initializer=_init_worker, initargs=(self.reader,))
 
     def calib_all_spectra(self, **kwargs) -> list:
         """
@@ -54,41 +121,38 @@ class BatchProcessor:
         """
         uncalib_line_spectra = self.pick_mul_spectra(self.reader.spotTable.index, **kwargs)
         f = partial(simple_calibration, **kwargs, return_shift=True)
-
-        with mp.Pool(self.n_jobs) as pool:
-            if self.show_progress:
-                shifts = list(tqdm(pool.imap(f, [spectrum for spectrum in uncalib_line_spectra]),
-                                   total=len(uncalib_line_spectra)))
-            else:
-                shifts = pool.map(f, [spectrum for spectrum in uncalib_line_spectra])
+        shifts = self._map(f, uncalib_line_spectra)
         self.reader.shifts = np.array(shifts)
         self.reader.mean_shift = np.nanmean(self.reader.shifts)
         return uncalib_line_spectra
 
     def get_mul_spectra(self, indices, **kwargs):
-        f = partial(self.reader.get_spectrum, **kwargs)
-        with mp.Pool(self.n_jobs) as pool:
+        """
+        Read spectra with threads: reading is I/O bound and releases the GIL, and unlike
+        processes no spectra have to be pickled and the cached m/z axes are shared.
+        """
+        indices = np.asarray(indices)
+        results = [None] * len(indices)
+
+        def read(k):
+            results[k] = self.reader.get_spectrum(indices[k], **kwargs)
+
+        # read in file order for mostly sequential disk access, results keep the requested order
+        order = np.argsort(self.reader._raw_positions[indices], kind="stable")
+        with ThreadPoolExecutor(min(self.n_jobs, MAX_READ_THREADS)) as executor:
+            done = executor.map(read, order)
             if self.show_progress:
-                results = list(tqdm(pool.imap(f, indices), total=len(indices)))
-            else:
-                results = pool.map(f, indices)
+                done = tqdm(done, total=len(order))
+            for _ in done:
+                pass
         return results
 
     def pick_mul_spectra(self, indices, **kwargs):
-
-        f = partial(self.reader.pick_spectrum, line_spec=None, **kwargs)
-
-        with mp.Pool(self.n_jobs) as pool:
-            if self.show_progress:
-                results = list(tqdm(pool.imap(f, indices), total=len(indices)))
-            else:
-                results = pool.map(f, indices)
-        return results
+        return self._pick_map((index, None, kwargs) for index in indices)
 
     def pick_mul_from_uncalib_line_spectra(self, uncalib_line_spectra, **kwargs):
 
         indices = self.reader.spotTable.index
-        f = partial(self.reader.pick_spectrum, **kwargs)
 
         # calibrate the line spectra
         if hasattr(self.reader, "mean_shift"):
@@ -98,16 +162,8 @@ class BatchProcessor:
                 else:
                     uncalib_line_spectra[i][:, 0] -= self.reader.shifts[i]
 
-        line_specs = [[None,uncalib_line_spectra[i] ]for i in indices]
-        # zip nones with the indices
+        return self._pick_map((None, uncalib_line_spectra[i], kwargs) for i in indices)
 
-
-        with mp.Pool(self.n_jobs) as pool:
-            if self.show_progress:
-                results = list(tqdm(pool.starmap(f, line_specs), total=len(line_specs)))
-            else:
-                results = pool.starmap(f, line_specs)
-        return results
 
 class RtmsBrukerMCFReader:
     def __init__(self, mcfdir: str, files: list[str], spotTable: pd.DataFrame, offsetTable: pd.DataFrame, metadata: dict) -> None:
@@ -127,15 +183,15 @@ class RtmsBrukerMCFReader:
     def __len__(self) -> int:
         return len(self.get_spots()['SpotNumber'].values)
 
-    @property
+    @cached_property
     def mzs(self) -> np.ndarray[float]:
         return self.get_spectrum(0, return_mzs=True)[0]
 
-    @property
+    @cached_property
     def str_xy(self) -> pd.Series:
         return self.get_spots()['SpotNumber'].values
 
-    @property
+    @cached_property
     def xy(self):
         spot_x = [re.findall(r"X(\d+)", str(spot))[0] for spot in self.str_xy]
         spot_x = [int(x) for x in spot_x]
@@ -145,21 +201,61 @@ class RtmsBrukerMCFReader:
         return spot
 
 
-    @property
+    @cached_property
     def metadataDF(self):
         return self.get_metadata(1)
 
-    @property
+    @cached_property
     def q1mass(self):
         return float(self.metadataDF.query("PermanentName == 'Q1Mass'")["Value"].values[0].split(' ')[0])
 
-    @property
+    @cached_property
     def q1res(self):
         return float(self.metadataDF.query("PermanentName == 'Q1Res'")["Value"].values[0].split(' ')[0])
 
+    @cached_property
+    def _mmap(self) -> mmap.mmap:
+        # memory map of the main data file, created lazily once per process
+        with open(os.path.join(self.mcfdir, self.files[0]), "rb") as f:
+            return mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+
     @property
     def con(self):
-        return open(os.path.join(self.mcfdir, self.files[0]), "rb")
+        # independent cursor so that concurrent readers do not share a file position
+        return _MMapCursor(self._mmap)
+
+    def close(self):
+        mm = self.__dict__.pop("_mmap", None)
+        if mm is not None:
+            mm.close()
+
+    def __getstate__(self):
+        # mmap objects cannot be pickled, workers recreate it on first access
+        state = self.__dict__.copy()
+        state.pop("_mmap", None)
+        state.pop("_index_axes", None)
+        state.pop("_mz_cache", None)
+        return state
+
+    def _blob_positions(self, blob_res_type: int) -> np.ndarray:
+        """Absolute file position of the blob of given type for each row in spotTable (-1 if missing)."""
+        sub = self.offsetTable[self.offsetTable["BlobResType"] == blob_res_type]
+        sub = sub.drop_duplicates("id").set_index("id").reindex(self.spotTable["id"])
+        positions = sub["OffsetPage"] * (2 ** 31) + sub["Offset"]
+        return positions.fillna(-1).astype(np.int64).to_numpy()
+
+    @cached_property
+    def _raw_positions(self) -> np.ndarray:
+        return self._blob_positions(258)
+
+    @cached_property
+    def _meta_positions(self) -> np.ndarray:
+        return self._blob_positions(259)
+
+    @cached_property
+    def _calib_params(self) -> Dict[str, np.ndarray]:
+        cols = ["frequencyHigh", "frequencyWidth", "size", "alpha", "beta"]
+        return {col: self.spotTable[col].to_numpy(dtype=float) for col in cols}
 
     def get_spots(self):
         mainIndex = self.files[1]
@@ -226,7 +322,8 @@ class RtmsBrukerMCFReader:
             spec = self.get_spectrum(index)
             # sort spec by first column
             spec_obj = MSSpectrum()
-            spec_obj.set_peaks([spec[0], spec[1]])
+            # pyopenms needs writable arrays, the cached m/z axis is read-only
+            spec_obj.set_peaks([np.require(spec[0], requirements="W"), spec[1]])
 
             picker = PeakPickerHiRes()
             picker_params = picker.getParameters()
@@ -285,14 +382,13 @@ class RtmsBrukerMCFReader:
         if index < 0 or index >= len(self.spotTable):
             raise IndexError("Index out of bounds")
 
-        fcon = self.con
-        row = self.spotTable.iloc[index]
-        spotId = row["id"]
+        position = self._raw_positions[index]
+        if position < 0:
+            raise IndexError(f"No raw data blob found for spot {self.spotTable['id'].iloc[index]}")
 
         # Seek to raw data blob
-        blob_row = self.offsetTable[(self.offsetTable["id"] == spotId) &
-                                    (self.offsetTable["BlobResType"] == 258)].iloc[0]
-        mcf_blobSeek(fcon, blob_row["Offset"], blob_row["OffsetPage"])
+        fcon = self.con
+        fcon.seek(position)
 
         mcf_checkBlobCodeWord(fcon)
         bin_checkBytes(fcon, b"\x01\x01")
@@ -308,55 +404,135 @@ class RtmsBrukerMCFReader:
 
         if typeByte == b"\x20":  # uncompressed 32-bit floats
             numValues = bin_readVarInt(fcon)
-            spectrum = np.frombuffer(fcon.read(numValues * 4), dtype="<f4")
+            # view into the mmap, only the returned part is copied below
+            raw = np.frombuffer(self._mmap, dtype="<f4", count=numValues, offset=fcon.tell())
         elif typeByte == b"\x22":  # gzip-compressed
             numBytes = bin_readVarInt(fcon)
             gzippedBytes = fcon.read(numBytes)
             unzipped = zlib.decompress(gzippedBytes)
-            spectrum = np.frombuffer(unzipped, dtype="<f4")
-            numValues = len(spectrum)
+            raw = np.frombuffer(unzipped, dtype="<f4")
+            numValues = len(raw)
         else:
             raise ValueError("Raw spectra must be an array of 32-bit floats.")
 
-
-        if return_mzs:
-            # the following parameters derived from spotTable are the calibrated parameters.
-            fhigh = row["frequencyHigh"]
-            fwidth = row["frequencyWidth"]
-            fsize = row["size"]
-            alpha = row["alpha"]
-            beta = row["beta"]
-
-
-            mzindex = np.arange(numValues)
-            mz = fhigh / ((fwidth * (fsize - mzindex) / fsize) - beta) + alpha / fhigh
-
-            if CASI_only:
-                lower = self.q1mass - self.q1res / 2
-                upper = self.q1mass + self.q1res / 2
-                mask = (mz >= lower) & (mz <= upper)
-                spectrum = spectrum[mask]
-                mz = mz[mask]
-        else:
+        if not return_mzs:
             # if return_mzs is False, return the spectrum only
-            mz = np.zeros(numValues)
+            return None, raw.copy()
 
-        # return np array of m/z and intensity combined
-        return mz, spectrum
+        # m/z axes are shared between spectra with identical calibration and therefore read-only
+        coeffs = self._calib_coefficients(index)
+        if not CASI_only:
+            mz = self._cached_mz(
+                ("full", coeffs, numValues),
+                lambda: self._mz_axis(coeffs, numValues, 0, numValues),
+            )
+            return mz, raw.copy()
+
+        lower = self.q1mass - self.q1res / 2
+        upper = self.q1mass + self.q1res / 2
+        selection, mz = self._cached_mz(
+            ("casi", coeffs, numValues, lower, upper),
+            lambda: self._casi_mz_axis(coeffs, numValues, lower, upper),
+        )
+        return mz, raw[selection].copy()
+
+    def _cached_mz(self, key, compute):
+        """Small LRU cache for m/z axes, the returned arrays are made read-only."""
+        cache = self.__dict__.setdefault("_mz_cache", OrderedDict())
+        with _MZ_CACHE_LOCK:
+            value = cache.get(key)
+            if value is not None:
+                cache.move_to_end(key)
+                return value
+        value = compute()
+        for arr in value if isinstance(value, tuple) else (value,):
+            if isinstance(arr, np.ndarray):
+                arr.flags.writeable = False
+        with _MZ_CACHE_LOCK:
+            # another thread may have computed the same axis meanwhile, share its result
+            value = cache.setdefault(key, value)
+            while len(cache) > MZ_CACHE_SIZE:
+                cache.popitem(last=False)
+        return value
+
+    def _casi_mz_axis(self, coeffs, numValues, lower, upper):
+        """Selection of data points with lower <= mz <= upper and their m/z values."""
+        window = self._mz_index_window(coeffs, numValues, lower, upper)
+        if window is not None:
+            start, stop = window
+            mz = self._mz_axis(coeffs, numValues, start, stop)
+            # trim the (slightly generous) window to the exact bounds
+            lo = start + np.searchsorted(mz, lower, side="left")
+            hi = start + np.searchsorted(mz, upper, side="right")
+            # make sure the window was wide enough, otherwise fall through to the full axis
+            if (lo > start or start == 0) and (hi < stop or stop == numValues):
+                return slice(lo, hi), mz[lo - start:hi - start].copy()
+
+        mz = self._mz_axis(coeffs, numValues, 0, numValues)
+        selection = np.flatnonzero((mz >= lower) & (mz <= upper))
+        return selection, mz[selection]
+
+    def _calib_coefficients(self, index):
+        """
+        Calibrated m/z of data point i is
+            fhigh / ((fwidth * (fsize - i) / fsize) - beta) + alpha / fhigh
+            = fhigh / (offset - slope * i) + shift
+        """
+        params = self._calib_params
+        fhigh = params["frequencyHigh"][index]
+        fwidth = params["frequencyWidth"][index]
+        fsize = params["size"][index]
+        alpha = params["alpha"][index]
+        beta = params["beta"][index]
+        return float(fhigh), float(fwidth / fsize), float(fwidth - beta), float(alpha / fhigh)
+
+    def _index_axis(self, n) -> np.ndarray:
+        # float data point indices, cached since np.arange is the slowest step of the m/z calculation
+        axes = self.__dict__.setdefault("_index_axes", {})
+        axis = axes.get(n)
+        if axis is None:
+            axis = axes[n] = np.arange(n, dtype=np.float64)
+        return axis
+
+    def _mz_axis(self, coeffs, numValues, start, stop) -> np.ndarray:
+        """m/z values of data points start..stop-1, evaluated in place to avoid temporaries."""
+        fhigh, slope, offset, shift = coeffs
+        mz = np.multiply(self._index_axis(numValues)[start:stop], -slope)
+        mz += offset
+        np.divide(fhigh, mz, out=mz)
+        mz += shift
+        return mz
+
+    def _mz_index_window(self, coeffs, numValues, lower, upper) -> Optional[Tuple[int, int]]:
+        """
+        Index range covering lower <= mz <= upper with a small margin, obtained by inverting the
+        calibration. Returns None if the m/z axis is not strictly increasing.
+        """
+        fhigh, slope, offset, shift = coeffs
+        # mz increases with i if fhigh, slope > 0 and the denominator stays positive
+        if not (fhigh > 0 and slope > 0 and offset - slope * (numValues - 1) > 0):
+            return None
+
+        def index_of(mz):
+            if mz <= shift:
+                return -np.inf
+            return (offset - fhigh / (mz - shift)) / slope
+
+        margin = 2
+        start = int(np.clip(np.floor(index_of(lower)) - margin, 0, numValues))
+        stop = int(np.clip(np.ceil(index_of(upper)) + margin + 1, start, numValues))
+        return start, stop
 
     def get_metadata(self, index):
-        blobRow = self.offsetTable[
-            (self.offsetTable["id"] == self.spotTable.iloc[index]["id"]) &
-            (self.offsetTable["BlobResType"] == 259)
-            ].index[0]
+        position = self._meta_positions[index]
+        if position < 0:
+            raise IndexError(f"No metadata blob found for spot {self.spotTable['id'].iloc[index]}")
 
         dectable = self.metadata["declarations"]
         reptable = self.metadata["replacements"]
 
         fcon = self.con
-        offset = self.offsetTable.at[blobRow, "Offset"]
-        offsetPage = self.offsetTable.at[blobRow, "OffsetPage"]
-        mcf_blobSeek(fcon, offset, offsetPage)
+        fcon.seek(position)
 
         mcf_checkBlobCodeWord(fcon)
         bin_checkBytes(fcon, b"\x01\x01")
