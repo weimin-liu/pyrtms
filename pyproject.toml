@@ -10,7 +10,8 @@ dependencies = [
     "pyopenms",
     "pandas",
     "matplotlib",
-    "tqdm"
+    "tqdm",
+    "h5py"
     ]
 
 [project.scripts]
