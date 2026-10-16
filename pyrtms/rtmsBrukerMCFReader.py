@@ -24,6 +24,9 @@ import matplotlib.pyplot as plt
 import h5py
 
 
+BLOB_CODE_WORD = bytes([0xC0, 0xDE, 0xAF, 0xFE])
+
+
 def write_intensities_to_hdf5(data:List[Tuple[np.array, np.array]], path, **kwargs):
     if os.path.exists(path):
         raise FileExistsError(path)
@@ -107,29 +110,29 @@ class BatchProcessor:
         return results
 
 class RtmsBrukerMCFReader:
-    def __init__(self, mcfdir, files, spotTable, offsetTable, metadata):
+    def __init__(self, mcfdir: str, files: list[str], spotTable: pd.DataFrame, offsetTable: pd.DataFrame, metadata: dict) -> None:
         assert isinstance(mcfdir, str), "dir must be a string"
         assert isinstance(files, list), "files must be a dictionary"
         assert isinstance(spotTable, pd.DataFrame), "spotTable must be a DataFrame"
         assert isinstance(offsetTable, pd.DataFrame), "offsetTable must be a DataFrame"
         assert isinstance(metadata, dict), "metadata must be a dictionary"
 
-        self.mcfdir = mcfdir
-        self.files = files
-        self.spotTable = spotTable
-        self.offsetTable = offsetTable
-        self.metadata = metadata
+        self.mcfdir: str = mcfdir
+        self.files: list[str] = files
+        self.spotTable: pd.DataFrame = spotTable
+        self.offsetTable: pd.DataFrame = offsetTable
+        self.metadata: dict = metadata
         self.spots = None
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.get_spots()['SpotNumber'].values)
 
     @property
-    def mzs(self):
+    def mzs(self) -> np.ndarray[float]:
         return self.get_spectrum(0, return_mzs=True)[0]
 
     @property
-    def str_xy(self):
+    def str_xy(self) -> pd.Series:
         return self.get_spots()['SpotNumber'].values
 
     @property
@@ -210,6 +213,7 @@ class RtmsBrukerMCFReader:
             )
 
     def pick_spectrum(self, index=None, line_spec=None, **kwargs):
+        """Pick peaks from spectrum"""
 
         if line_spec is not None:
             mz = line_spec[:, 0]
@@ -403,7 +407,7 @@ class RtmsBrukerMCFReader:
 
 
 def mcf_checkBlobCodeWord(fcon):
-    expected = bytes([0xC0, 0xDE, 0xAF, 0xFE])
+    expected = BLOB_CODE_WORD
     bin_checkBytes(fcon, expected, "Invalid code word.")
 
 
