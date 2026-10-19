@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple, Callable, Any
 
 import struct
 import threading
@@ -28,30 +28,34 @@ import matplotlib.pyplot as plt
 import h5py
 
 
-print('with better multithreading')
+CalibCoefficients: type = tuple[float, float, float, float]
 BLOB_CODE_WORD = bytes([0xC0, 0xDE, 0xAF, 0xFE])
 
 # number of distinct m/z axes (calibrations) kept per reader
 MZ_CACHE_SIZE = 8
+# create lock for caching m/z entries across threads
 _MZ_CACHE_LOCK = threading.Lock()
 
 
 class _MMapCursor:
     """Minimal file-like reader over a shared buffer with its own position."""
 
+    # to reduce memory and don't allow attribute assignment
     __slots__ = ("buf", "pos")
 
     def __init__(self, buf):
         self.buf = buf
-        self.pos = 0
+        self.pos: int = 0
 
     def read(self, n=-1):
+        """Read n bytes fromt the buffer, starting at the current position and moving the position forward."""
         end = len(self.buf) if n < 0 else self.pos + n
         data = self.buf[self.pos:end]
         self.pos += len(data)
         return data
 
-    def seek(self, offset, whence=0):
+    def seek(self, offset: int, whence=0):
+        """Move the position to the given offeset (absolute if whence == 0, relative if whence == 1, or from the end if whence == 2)."""
         if whence == 0:
             self.pos = offset
         elif whence == 1:
@@ -60,7 +64,8 @@ class _MMapCursor:
             self.pos = len(self.buf) + offset
         return self.pos
 
-    def tell(self):
+    def tell(self) -> int:
+        """Return the current position."""
         return self.pos
 
 
@@ -87,6 +92,7 @@ _worker_reader: 'RtmsBrukerMCFReader' = None
 
 
 def _init_worker(reader: 'RtmsBrukerMCFReader'):
+    """Initialize a worker"""
     global _worker_reader
     _worker_reader = reader
 
@@ -188,16 +194,17 @@ class RtmsBrukerMCFReader:
         return self.get_spectrum(0, return_mzs=True)[0]
 
     @cached_property
-    def str_xy(self) -> pd.Series:
+    def str_xy(self) -> np.ndarray:
         return self.get_spots()['SpotNumber'].values
 
     @cached_property
-    def xy(self):
-        spot_x = [re.findall(r"X(\d+)", str(spot))[0] for spot in self.str_xy]
-        spot_x = [int(x) for x in spot_x]
-        spot_y = [re.findall(r"Y(\d+)", str(spot))[0] for spot in self.str_xy]
-        spot_y = [int(y) for y in spot_y]
-        spot = np.column_stack((spot_x, spot_y))
+    def xy(self) -> np.ndarray[int]:
+        """Create an array where each row containts the spot indices x,y"""
+        spot_x: list[str] = [re.findall(r"X(\d+)", str(spot))[0] for spot in self.str_xy]
+        spot_x: list[int] = [int(x) for x in spot_x]
+        spot_y: list[str] = [re.findall(r"Y(\d+)", str(spot))[0] for spot in self.str_xy]
+        spot_y: list[int] = [int(y) for y in spot_y]
+        spot: np.ndarray[int] = np.column_stack((spot_x, spot_y))
         return spot
 
 
@@ -237,30 +244,31 @@ class RtmsBrukerMCFReader:
         state.pop("_mz_cache", None)
         return state
 
-    def _blob_positions(self, blob_res_type: int) -> np.ndarray:
+    def _blob_positions(self, blob_res_type: int) -> np.ndarray[np.int64]:
         """Absolute file position of the blob of given type for each row in spotTable (-1 if missing)."""
-        sub = self.offsetTable[self.offsetTable["BlobResType"] == blob_res_type]
-        sub = sub.drop_duplicates("id").set_index("id").reindex(self.spotTable["id"])
-        positions = sub["OffsetPage"] * (2 ** 31) + sub["Offset"]
+        sub: pd.DataFrame = self.offsetTable[self.offsetTable["BlobResType"] == blob_res_type]
+        sub: pd.DataFrame = sub.drop_duplicates("id").set_index("id").reindex(self.spotTable["id"])
+        positions: pd.Series = sub["OffsetPage"] * (2 ** 31) + sub["Offset"]
         return positions.fillna(-1).astype(np.int64).to_numpy()
 
     @cached_property
-    def _raw_positions(self) -> np.ndarray:
+    def _raw_positions(self) -> np.ndarray[np.int64]:
         return self._blob_positions(258)
 
     @cached_property
-    def _meta_positions(self) -> np.ndarray:
+    def _meta_positions(self) -> np.ndarray[np.int64]:
         return self._blob_positions(259)
 
     @cached_property
-    def _calib_params(self) -> Dict[str, np.ndarray]:
-        cols = ["frequencyHigh", "frequencyWidth", "size", "alpha", "beta"]
+    def _calib_params(self) -> dict[str, np.ndarray]:
+        # for faster accessing, convert dataframe to dict
+        cols: list[str] = ["frequencyHigh", "frequencyWidth", "size", "alpha", "beta"]
         return {col: self.spotTable[col].to_numpy(dtype=float) for col in cols}
 
-    def get_spots(self):
-        mainIndex = self.files[1]
+    def get_spots(self) -> pd.DataFrame:
+        main_index = self.files[1]
 
-        with sqlite3.connect(os.path.join(self.mcfdir, mainIndex)) as conn:
+        with sqlite3.connect(os.path.join(self.mcfdir, main_index)) as conn:
             cur = conn.cursor()
             spot_name = cur.execute("SELECT GuidA, GuidB, MetaDataID, Value from MetaDataString WHERE MetaDataID='64'")
             spot_name = spot_name.fetchall()
@@ -268,7 +276,8 @@ class RtmsBrukerMCFReader:
         return self.spots
 
     @classmethod
-    def from_dir(cls, mcfdir):
+    def from_dir(cls, mcfdir: str):
+        """Initialize from .d directory by parsing files"""
         files = os.listdir(mcfdir)
         mainFile = [f for f in files if f.endswith('_1.mcf')]
         if len(mainFile) == 0:
@@ -378,7 +387,7 @@ class RtmsBrukerMCFReader:
             return_mzs: bool = None,
             intensities_only: bool = None,
             limits: tuple[float, float] = None
-    ):
+    ) -> tuple[np.ndarray | None, np.ndarray]:
         """
         Read the profile spectrum with the given (0-based) index.
 
@@ -401,20 +410,23 @@ class RtmsBrukerMCFReader:
         """
         if (return_mzs is not None) and (intensities_only is not None):
             raise ValueError("Only one of return_mzs or intensities_only should be provided")
+        if CASI_only and (limits is not None):
+            raise ValueError("Only one of CASI_only or limits should be provided")
 
         if return_mzs is None:
-            return_mzs = not intensities_only if intensities_only is not None else True
+            # if return_mzs and intensities_only are none, default to returning mz values
+            return_mzs: bool = (not intensities_only) if (intensities_only is not None) else True
 
         if index < 0 or index >= len(self.spotTable):
             raise IndexError("Index out of bounds")
 
-        position = self._raw_positions[index]
-        if position < 0:
+        spec_start_position: np.int64 = self._raw_positions[index]
+        if spec_start_position < 0:
             raise IndexError(f"No raw data blob found for spot {self.spotTable['id'].iloc[index]}")
 
         # Seek to raw data blob
-        fcon = self.con
-        fcon.seek(position)
+        fcon: _MMapCursor = self.con
+        fcon.seek(spec_start_position)
 
         mcf_checkBlobCodeWord(fcon)
         bin_checkBytes(fcon, b"\x01\x01")
@@ -429,82 +441,108 @@ class RtmsBrukerMCFReader:
         typeByte = fcon.read(1)
 
         if typeByte == b"\x20":  # uncompressed 32-bit floats
-            numValues = bin_readVarInt(fcon)
+            num_values: int = bin_readVarInt(fcon)
             # view into the mmap, only the returned part is copied below
-            raw = np.frombuffer(self._mmap, dtype="<f4", count=numValues, offset=fcon.tell())
+            raw: np.ndarray = np.frombuffer(self._mmap, dtype="<f4", count=num_values, offset=fcon.tell())
         elif typeByte == b"\x22":  # gzip-compressed
-            numBytes = bin_readVarInt(fcon)
-            gzippedBytes = fcon.read(numBytes)
-            unzipped = zlib.decompress(gzippedBytes)
-            raw = np.frombuffer(unzipped, dtype="<f4")
-            numValues = len(raw)
+            num_bytes = bin_readVarInt(fcon)
+            gzipped_bytes = fcon.read(num_bytes)
+            unzipped = zlib.decompress(gzipped_bytes)
+            raw: np.ndarray = np.frombuffer(unzipped, dtype="<f4")
+            num_values: int = raw.shape[0]
         else:
             raise ValueError("Raw spectra must be an array of 32-bit floats.")
 
-        if not return_mzs:
-            # if return_mzs is False, return the spectrum only
-            return None, raw.copy()
+        if CASI_only:
+            # calculate mz limits from Q1 mass and Q1 resolution and set limits from CASI window
+            limits: tuple[float, float] = (self.q1mass - self.q1res / 2, self.q1mass + self.q1res / 2)
 
-        # m/z axes are shared between spectra with identical calibration and therefore read-only
-        coeffs = self._calib_coefficients(index)
-        if not CASI_only:
-            mz = self._cached_mz(
-                ("full", coeffs, numValues),
-                lambda: self._mz_axis(coeffs, numValues, 0, numValues),
+        if limits is None:
+            if not return_mzs:
+                # if return_mzs is False, return the spectrum only
+                return None, raw.copy()
+            # m/z axes are shared between spectra with identical calibration and therefore read-only
+            calib_coeffs: CalibCoefficients = self._get_calib_coefficients(index)
+            # get mz values corresponding to limits and calibration parameters
+            mzs: np.ndarray[np.float64] = self._cached_mz(
+                ("full", calib_coeffs, num_values),
+                lambda: self._mz_axis(calib_coeffs, num_values, 0, num_values)
             )
-            return mz, raw.copy()
+            return mzs, raw.copy()
 
-        lower = self.q1mass - self.q1res / 2
-        upper = self.q1mass + self.q1res / 2
-        selection, mz = self._cached_mz(
-            ("casi", coeffs, numValues, lower, upper),
-            lambda: self._casi_mz_axis(coeffs, numValues, lower, upper),
+        # only copy the data points within the window, the selection depends on the
+        # calibration and is cached together with the m/z values
+        mz_lower, mz_upper = float(limits[0]), float(limits[1])
+        calib_coeffs: CalibCoefficients = self._get_calib_coefficients(index)
+        mzs: np.ndarray[np.float64]
+        selection, mzs = self._cached_mz(
+            ("window", calib_coeffs, num_values, mz_lower, mz_upper),
+            lambda: self._casi_mz_axis(calib_coeffs, num_values, mz_lower, mz_upper)
         )
-        return mz, raw[selection].copy()
+        return (mzs if return_mzs else None), raw[selection].copy()
 
-    def _cached_mz(self, key, compute):
-        """Small LRU cache for m/z axes, the returned arrays are made read-only."""
-        cache = self.__dict__.setdefault("_mz_cache", OrderedDict())
-        with _MZ_CACHE_LOCK:
-            value = cache.get(key)
+    def _cached_mz(
+            self,
+            key: tuple[str, CalibCoefficients, int, float, float] | tuple[str, CalibCoefficients, int],
+            callback: Callable
+    ):
+        """
+        Small LRU cache for m/z axes, the returned arrays are made read-only.
+
+        If the specified key is not in the cache, will assign the returned value of callback
+        """
+        # self.__dict__.setdefault("_mz_cache", OrderedDict())
+        if "_mz_cache" not in self.__dict__:
+            self._mz_cache: OrderedDict[tuple[str, CalibCoefficients, int, float, float], Any] = OrderedDict()
+        mz_cache: OrderedDict[tuple[str, CalibCoefficients, int, float, float], Any] = self._mz_cache
+
+        with _MZ_CACHE_LOCK:  # make sure no other thread operates on the cache at the same time
+            value = mz_cache.get(key)
             if value is not None:
-                cache.move_to_end(key)
+                mz_cache.move_to_end(key)
                 return value
-        value = compute()
-        for arr in value if isinstance(value, tuple) else (value,):
+        value = callback()
+        for arr in (value if isinstance(value, tuple) else (value,)):
             if isinstance(arr, np.ndarray):
                 arr.flags.writeable = False
         with _MZ_CACHE_LOCK:
             # another thread may have computed the same axis meanwhile, share its result
-            value = cache.setdefault(key, value)
-            while len(cache) > MZ_CACHE_SIZE:
-                cache.popitem(last=False)
+            value = mz_cache.setdefault(key, value)
+            while len(mz_cache) > MZ_CACHE_SIZE:
+                mz_cache.popitem(last=False)
         return value
 
-    def _casi_mz_axis(self, coeffs, numValues, lower, upper):
+    def _casi_mz_axis(
+            self,
+            calib_coeffs: CalibCoefficients,
+            num_values: int,
+            mz_lower: float,
+            mz_upper: float
+    ) -> tuple[slice | np.ndarray[int], np.ndarray[np.float64]]:
         """Selection of data points with lower <= mz <= upper and their m/z values."""
-        window = self._mz_index_window(coeffs, numValues, lower, upper)
+        window: tuple[int, int] = self._get_mz_index_window(calib_coeffs, num_values, mz_lower, mz_upper)
         if window is not None:
             start, stop = window
-            mz = self._mz_axis(coeffs, numValues, start, stop)
+            mzs: np.ndarray[np.float64] = self._mz_axis(calib_coeffs, num_values, start, stop)
             # trim the (slightly generous) window to the exact bounds
-            lo = start + np.searchsorted(mz, lower, side="left")
-            hi = start + np.searchsorted(mz, upper, side="right")
+            lo: int = start + np.searchsorted(mzs, mz_lower, side="left")
+            hi: int = start + np.searchsorted(mzs, mz_upper, side="right")
             # make sure the window was wide enough, otherwise fall through to the full axis
-            if (lo > start or start == 0) and (hi < stop or stop == numValues):
-                return slice(lo, hi), mz[lo - start:hi - start].copy()
+            if (lo > start or start == 0) and (hi < stop or stop == num_values):
+                return slice(lo, hi), mzs[lo - start:hi - start].copy()
 
-        mz = self._mz_axis(coeffs, numValues, 0, numValues)
-        selection = np.flatnonzero((mz >= lower) & (mz <= upper))
-        return selection, mz[selection]
+        mzs: np.ndarray[np.float64] = self._mz_axis(calib_coeffs, num_values, 0, num_values)
+        # indices where mask is non-zero
+        selection: np.ndarray[int] = np.flatnonzero((mzs >= mz_lower) & (mzs <= mz_upper))
+        return selection, mzs[selection]
 
-    def _calib_coefficients(self, index):
+    def _get_calib_coefficients(self, index: int) -> CalibCoefficients:
         """
         Calibrated m/z of data point i is
             fhigh / ((fwidth * (fsize - i) / fsize) - beta) + alpha / fhigh
             = fhigh / (offset - slope * i) + shift
         """
-        params = self._calib_params
+        params: dict[str, np.ndarray] = self._calib_params
         fhigh = params["frequencyHigh"][index]
         fwidth = params["frequencyWidth"][index]
         fsize = params["size"][index]
@@ -512,44 +550,54 @@ class RtmsBrukerMCFReader:
         beta = params["beta"][index]
         return float(fhigh), float(fwidth / fsize), float(fwidth - beta), float(alpha / fhigh)
 
-    def _index_axis(self, n) -> np.ndarray:
+    def _index_axis(self, num_values: int) -> np.ndarray[np.float64]:
+        """Getter for mz values container with a certain number of values."""
         # float data point indices, cached since np.arange is the slowest step of the m/z calculation
-        axes = self.__dict__.setdefault("_index_axes", {})
-        axis = axes.get(n)
+        axes: dict[int, np.ndarray[np.float64]] = self.__dict__.setdefault("_index_axes", {})
+        axis: np.ndarray[np.float64] | None = axes.get(num_values)
         if axis is None:
-            axis = axes[n] = np.arange(n, dtype=np.float64)
+            axis: np.ndarray[np.float64] = np.arange(num_values, dtype=np.float64)
+            axes[num_values] = axis
         return axis
 
-    def _mz_axis(self, coeffs, numValues, start, stop) -> np.ndarray:
+    def _mz_axis(
+            self,
+            coeffs: CalibCoefficients,
+            num_values: int,
+            mz_index_start: int,
+            mz_index_stop: int
+    ) -> np.ndarray[np.float64]:
         """m/z values of data points start..stop-1, evaluated in place to avoid temporaries."""
         fhigh, slope, offset, shift = coeffs
-        mz = np.multiply(self._index_axis(numValues)[start:stop], -slope)
+        mz: np.ndarray[np.float64] = np.multiply(self._index_axis(num_values)[mz_index_start:mz_index_stop], -slope)
         mz += offset
         np.divide(fhigh, mz, out=mz)
         mz += shift
         return mz
 
-    def _mz_index_window(self, coeffs, numValues, lower, upper) -> Optional[Tuple[int, int]]:
+    @staticmethod
+    def _get_mz_index_window(calib_coeffs: CalibCoefficients, num_values: int, mz_lower, mz_upper) -> tuple[int, int] | None:
         """
         Index range covering lower <= mz <= upper with a small margin, obtained by inverting the
         calibration. Returns None if the m/z axis is not strictly increasing.
         """
-        fhigh, slope, offset, shift = coeffs
+        fhigh, slope, offset, shift = calib_coeffs
         # mz increases with i if fhigh, slope > 0 and the denominator stays positive
-        if not (fhigh > 0 and slope > 0 and offset - slope * (numValues - 1) > 0):
+        if not (fhigh > 0 and slope > 0 and offset - slope * (num_values - 1) > 0):
             return None
 
-        def index_of(mz):
+        def index_of(mz: float) -> float:
             if mz <= shift:
                 return -np.inf
             return (offset - fhigh / (mz - shift)) / slope
 
-        margin = 2
-        start = int(np.clip(np.floor(index_of(lower)) - margin, 0, numValues))
-        stop = int(np.clip(np.ceil(index_of(upper)) + margin + 1, start, numValues))
+        # add margin to indices to account for post-hoc calibration shifts
+        margin: int = 2
+        start: int = int(np.clip(np.floor(index_of(mz_lower)) - margin, 0, num_values))
+        stop: int = int(np.clip(np.ceil(index_of(mz_upper)) + margin + 1, start, num_values))
         return start, stop
 
-    def get_metadata(self, index):
+    def get_metadata(self, index) -> pd.DataFrame:
         position = self._meta_positions[index]
         if position < 0:
             raise IndexError(f"No metadata blob found for spot {self.spotTable['id'].iloc[index]}")
