@@ -1,9 +1,9 @@
 [project]
 name = "pyrtms"
-version = "0.5.2"
-description = "A partial python import of the R package rtms https://cran.r-project.org/web/packages/rtms/index.html"
+version = "0.5.3"
+description = "A python package for reading Bruker MSI vendor files quickly. Initially translated from the R package 'rtms' at https://cran.r-project.org/web/packages/rtms/index.html"
 readme = "README.md"
-authors = [{ name="Weimin Liu", email="wliu@marum.de" }]
+authors = [{ name="Weimin Liu", email="wliu@marum.de" }, { name="Yannick Zander", email="yzander@marum.de" }]
 dependencies = [
     "numpy",
     "shiny",

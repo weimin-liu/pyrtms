@@ -194,10 +194,13 @@ class RtmsBrukerMCFReader:
         return self.spotTable.index.values
 
     @cached_property
+    def all_mz_values_same(self) -> bool:
+        # check if all calibration parameters are the same, if not mz values will not be the same
+        return self.spotTable.loc[:, ["frequencyHigh", "frequencyWidth", "size", "alpha", "beta"]].drop_duplicates() == 1
+
+    @cached_property
     def mzs(self) -> np.ndarray[float]:
-        cols = ["frequencyHigh", "frequencyWidth", "size", "alpha", "beta"]
-        if len(self.spotTable[cols].drop_duplicates()) > 1:
-            # check if all calibration parameters are the same, if not mz values will not be the same
+        if not self.all_mz_values_same:
             raise ValueError("Encountered spectra with non-equally sampled mz values.")
         return self.get_spectrum(0, return_mzs=True)[0]
 
