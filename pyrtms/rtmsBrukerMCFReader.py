@@ -189,8 +189,16 @@ class RtmsBrukerMCFReader:
     def __len__(self) -> int:
         return len(self.get_spots()['SpotNumber'].values)
 
+    @property
+    def indices(self) -> np.ndarray[int]:
+        return self.spotTable.index.values
+
     @cached_property
     def mzs(self) -> np.ndarray[float]:
+        cols = ["frequencyHigh", "frequencyWidth", "size", "alpha", "beta"]
+        if len(self.spotTable[cols].drop_duplicates()) > 1:
+            # check if all calibration parameters are the same, if not mz values will not be the same
+            raise ValueError("Encountered spectra with non-equally sampled mz values.")
         return self.get_spectrum(0, return_mzs=True)[0]
 
     @cached_property
@@ -207,7 +215,6 @@ class RtmsBrukerMCFReader:
         spot: np.ndarray[int] = np.column_stack((spot_x, spot_y))
         return spot
 
-
     @cached_property
     def metadataDF(self):
         return self.get_metadata(1)
@@ -219,6 +226,10 @@ class RtmsBrukerMCFReader:
     @cached_property
     def q1res(self):
         return float(self.metadataDF.query("PermanentName == 'Q1Res'")["Value"].values[0].split(' ')[0])
+
+    @property
+    def casi_window(self) -> tuple[float, float]:
+        return self.q1mass - self.q1res / 2, self.q1mass + self.q1res / 2
 
     @cached_property
     def _mmap(self) -> mmap.mmap:
@@ -266,13 +277,14 @@ class RtmsBrukerMCFReader:
         return {col: self.spotTable[col].to_numpy(dtype=float) for col in cols}
 
     def get_spots(self) -> pd.DataFrame:
-        main_index = self.files[1]
+        if self.spots is None:
+            main_index = self.files[1]
 
-        with sqlite3.connect(os.path.join(self.mcfdir, main_index)) as conn:
-            cur = conn.cursor()
-            spot_name = cur.execute("SELECT GuidA, GuidB, MetaDataID, Value from MetaDataString WHERE MetaDataID='64'")
-            spot_name = spot_name.fetchall()
-            self.spots = pd.DataFrame(spot_name, columns=["GuidA", "GuidB", "MetaDataID", "SpotNumber"])
+            with sqlite3.connect(os.path.join(self.mcfdir, main_index)) as conn:
+                cur = conn.cursor()
+                spot_name = cur.execute("SELECT GuidA, GuidB, MetaDataID, Value from MetaDataString WHERE MetaDataID='64'")
+                spot_name = spot_name.fetchall()
+                self.spots = pd.DataFrame(spot_name, columns=["GuidA", "GuidB", "MetaDataID", "SpotNumber"])
         return self.spots
 
     @classmethod

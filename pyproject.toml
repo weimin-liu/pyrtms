@@ -1,6 +1,6 @@
 [project]
 name = "pyrtms"
-version = "0.5.1"
+version = "0.5.2"
 description = "A partial python import of the R package rtms https://cran.r-project.org/web/packages/rtms/index.html"
 readme = "README.md"
 authors = [{ name="Weimin Liu", email="wliu@marum.de" }]
