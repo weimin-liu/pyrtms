@@ -371,9 +371,35 @@ class RtmsBrukerMCFReader:
                     result.append([np.nan, np.nan])
             return np.array(result)
 
-    def get_spectrum(self, index, CASI_only=False, return_mzs=None, intensities_only=None):
+    def get_spectrum(
+            self,
+            index: int,
+            CASI_only: bool = False,
+            return_mzs: bool = None,
+            intensities_only: bool = None,
+            limits: tuple[float, float] = None
+    ):
+        """
+        Read the profile spectrum with the given (0-based) index.
 
-        if return_mzs is not None and intensities_only is not None:
+        Parameters
+        ----------
+        index : int
+            Position of the spectrum in the spotTable.
+        CASI_only : bool, optional
+            Only return data points within the CASI window (Q1Mass +/- Q1Res / 2).
+        return_mzs, intensities_only : bool, optional
+            Whether to return the m/z values (otherwise None is returned instead).
+        limits : tuple[float, float], optional
+            Only return data points with limits[0] <= mz <= limits[1]. Only this
+            part of the spectrum is copied, which is much faster for narrow
+            windows. Cannot be combined with CASI_only.
+
+        Returns
+        -------
+        mz, intensities : tuple[np.ndarray | None, np.ndarray]
+        """
+        if (return_mzs is not None) and (intensities_only is not None):
             raise ValueError("Only one of return_mzs or intensities_only should be provided")
 
         if return_mzs is None:
