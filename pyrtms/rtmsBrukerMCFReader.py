@@ -35,6 +35,10 @@ BLOB_CODE_WORD = bytes([0xC0, 0xDE, 0xAF, 0xFE])
 MZ_CACHE_SIZE = 8
 # create lock for caching m/z entries across threads
 _MZ_CACHE_LOCK = threading.Lock()
+# lock for creating the per-thread file handles
+_FILE_HANDLE_LOCK = threading.Lock()
+# the header of a raw data blob (code word, guid, name, type, length) is well below this
+RAW_HEADER_BYTES = 256
 
 
 class _MMapCursor:
@@ -245,15 +249,56 @@ class RtmsBrukerMCFReader:
         # independent cursor so that concurrent readers do not share a file position
         return _MMapCursor(self._mmap)
 
+    def _file_handle(self):
+        """
+        Unbuffered handle of the main data file, one per thread so that concurrent readers do not share a file position.
+
+        Spectra are read with plain file reads instead of the memory map: pages of a memory map stay in the
+        working set of the process, which grows to the size of the data read (often larger than the RAM).
+        """
+        handles: dict = self.__dict__.get("_file_handles")
+        if handles is None:
+            with _FILE_HANDLE_LOCK:
+                handles = self.__dict__.setdefault("_file_handles", {})
+        thread_id: int = threading.get_ident()
+        fh = handles.get(thread_id)
+        if fh is None:
+            fh = open(os.path.join(self.mcfdir, self.files[0]), "rb", buffering=0)
+            with _FILE_HANDLE_LOCK:
+                handles[thread_id] = fh
+        return fh
+
+    @staticmethod
+    def _read_bytes(fh, position: int, num_bytes: int) -> bytes:
+        fh.seek(position)
+        return fh.read(num_bytes)
+
+    @staticmethod
+    def _read_floats(fh, position: int, start: int, stop: int) -> np.ndarray[np.float32]:
+        """Read the 32-bit floats start..stop-1 of the array beginning at position."""
+        out: np.ndarray[np.float32] = np.empty(stop - start, dtype="<f4")
+        buffer: memoryview = memoryview(out).cast("B")
+        fh.seek(position + 4 * start)
+        num_read: int = 0
+        while num_read < len(buffer):
+            n = fh.readinto(buffer[num_read:])
+            if not n:
+                raise EOFError("Unexpected end of file while reading spectrum.")
+            num_read += n
+        return out
+
     def close(self):
         mm = self.__dict__.pop("_mmap", None)
         if mm is not None:
             mm.close()
+        for fh in self.__dict__.pop("_file_handles", {}).values():
+            fh.close()
 
     def __getstate__(self):
-        # mmap objects cannot be pickled, workers recreate it on first access
+        # mmap objects and file handles cannot be pickled, workers recreate them on first access
         state = self.__dict__.copy()
         state.pop("_mmap", None)
+        state.pop("_file_handles", None)
         state.pop("_index_axes", None)
         state.pop("_mz_cache", None)
         return state
@@ -439,9 +484,10 @@ class RtmsBrukerMCFReader:
         if spec_start_position < 0:
             raise IndexError(f"No raw data blob found for spot {self.spotTable['id'].iloc[index]}")
 
-        # Seek to raw data blob
-        fcon: _MMapCursor = self.con
-        fcon.seek(spec_start_position)
+        # parse the header from a small read of the raw data blob
+        spec_start_position: int = int(spec_start_position)
+        fh = self._file_handle()
+        fcon: _MMapCursor = _MMapCursor(self._read_bytes(fh, spec_start_position, RAW_HEADER_BYTES))
 
         mcf_checkBlobCodeWord(fcon)
         bin_checkBytes(fcon, b"\x01\x01")
@@ -455,18 +501,26 @@ class RtmsBrukerMCFReader:
         bin_checkBytes(fcon, b"\x03", "Raw spectra must be an array.")
         typeByte = fcon.read(1)
 
+        raw: np.ndarray | None
         if typeByte == b"\x20":  # uncompressed 32-bit floats
             num_values: int = bin_readVarInt(fcon)
-            # view into the mmap, only the returned part is copied below
-            raw: np.ndarray = np.frombuffer(self._mmap, dtype="<f4", count=num_values, offset=fcon.tell())
+            # read lazily below, only the returned part of the spectrum is read from disk
+            data_position: int = spec_start_position + fcon.tell()
+            raw = None
         elif typeByte == b"\x22":  # gzip-compressed
             num_bytes = bin_readVarInt(fcon)
-            gzipped_bytes = fcon.read(num_bytes)
+            gzipped_bytes = self._read_bytes(fh, spec_start_position + fcon.tell(), num_bytes)
             unzipped = zlib.decompress(gzipped_bytes)
-            raw: np.ndarray = np.frombuffer(unzipped, dtype="<f4")
+            raw = np.frombuffer(unzipped, dtype="<f4")
             num_values: int = raw.shape[0]
         else:
             raise ValueError("Raw spectra must be an array of 32-bit floats.")
+
+        def read(start: int, stop: int) -> np.ndarray[np.float32]:
+            """Writable copy of the intensities start..stop-1."""
+            if raw is None:
+                return self._read_floats(fh, data_position, start, stop)
+            return raw[start:stop].copy()
 
         if CASI_only:
             # calculate mz limits from Q1 mass and Q1 resolution and set limits from CASI window
@@ -475,7 +529,7 @@ class RtmsBrukerMCFReader:
         if limits is None:
             if not return_mzs:
                 # if return_mzs is False, return the spectrum only
-                return None, raw.copy()
+                return None, read(0, num_values)
             # m/z axes are shared between spectra with identical calibration and therefore read-only
             calib_coeffs: CalibCoefficients = self._get_calib_coefficients(index)
             # get mz values corresponding to limits and calibration parameters
@@ -483,7 +537,7 @@ class RtmsBrukerMCFReader:
                 ("full", calib_coeffs, num_values),
                 lambda: self._mz_axis(calib_coeffs, num_values, 0, num_values)
             )
-            return mzs, raw.copy()
+            return mzs, read(0, num_values)
 
         # only copy the data points within the window, the selection depends on the
         # calibration and is cached together with the m/z values
@@ -494,7 +548,11 @@ class RtmsBrukerMCFReader:
             ("window", calib_coeffs, num_values, mz_lower, mz_upper),
             lambda: self._casi_mz_axis(calib_coeffs, num_values, mz_lower, mz_upper)
         )
-        return (mzs if return_mzs else None), raw[selection].copy()
+        if isinstance(selection, slice):
+            intensities: np.ndarray[np.float32] = read(selection.start, selection.stop)
+        else:  # m/z axis not monotonic, select from the full spectrum
+            intensities: np.ndarray[np.float32] = read(0, num_values)[selection]
+        return (mzs if return_mzs else None), intensities
 
     def _cached_mz(
             self,
