@@ -494,7 +494,7 @@ class RtmsBrukerMCFReader:
             ("window", calib_coeffs, num_values, mz_lower, mz_upper),
             lambda: self._casi_mz_axis(calib_coeffs, num_values, mz_lower, mz_upper)
         )
-        return (mzs if return_mzs else None), raw[selection].copy()
+        return (mzs[selection] if return_mzs else None), raw[selection].copy()
 
     def _cached_mz(
             self,
